@@ -77,6 +77,11 @@ function rpm_proxy_signal(time::AbstractVector, rpm::AbstractVector; env_sr::Int
             out[i] = y0 * (1 - frac) + y1 * frac
         end
     end
+    # NaN in the source .arrow propagates through interpolation and then
+    # poisons cumsum-based smoothing. Treat NaN samples as "engine off".
+    @inbounds for i in eachindex(out)
+        isnan(out[i]) && (out[i] = 0.0)
+    end
     return out
 end
 
@@ -98,7 +103,8 @@ needs to shift right by `k` to align with `query`).
 """
 function fft_xcorr_lag(ref::AbstractVector{<:Real},
                        query::AbstractVector{<:Real},
-                       max_lag::Int)
+                       max_lag::Int;
+                       seed_k::Int = 0)
     N = min(length(ref), length(query))
     r = Float64.(view(ref, 1:N))
     q = Float64.(view(query, 1:N))
@@ -112,9 +118,12 @@ function fft_xcorr_lag(ref::AbstractVector{<:Real},
     xc = irfft(conj.(R) .* Q, n)
 
     max_lag = clamp(max_lag, 1, n ÷ 2 - 1)
-    best_k = 0; best_c = -Inf
-    @inbounds for k in -max_lag:max_lag
+    klo = seed_k - max_lag
+    khi = seed_k + max_lag
+    best_k = seed_k; best_c = -Inf
+    @inbounds for k in klo:khi
         idx = k >= 0 ? k + 1 : n + k + 1
+        (idx < 1 || idx > n) && continue
         c = xc[idx]
         if c > best_c
             best_c = c; best_k = k
@@ -124,6 +133,79 @@ function fft_xcorr_lag(ref::AbstractVector{<:Real},
     norm = sqrt(sum(abs2, r) * sum(abs2, q))
     confidence = norm == 0 ? 0.0 : best_c / norm
     return best_k, confidence
+end
+
+"""
+    fft_xcorr_top_k(ref, query, max_lag; k=10, min_spacing=0) -> Vector{Tuple{Int,Float64}}
+
+Like `fft_xcorr_lag` but returns the K highest peaks within `|lag| ≤ max_lag`,
+enforcing a minimum lag spacing between selected peaks (so we don't grab a
+cluster of samples around the same peak). Sorted by correlation value
+descending. Used by `align_audio_rpm` to short-list candidates that can be
+disambiguated by session-level features.
+"""
+function fft_xcorr_top_k(ref::AbstractVector{<:Real},
+                         query::AbstractVector{<:Real},
+                         max_lag::Int;
+                         k::Int = 10,
+                         min_spacing::Int = 0)
+    N = min(length(ref), length(query))
+    r = Float64.(view(ref, 1:N))
+    q = Float64.(view(query, 1:N))
+    replace!(r, NaN => 0.0); replace!(q, NaN => 0.0)
+    r .-= mean(r); q .-= mean(q)
+
+    n  = nextpow(2, 2N)
+    rp = vcat(r, zeros(n - N))
+    qp = vcat(q, zeros(n - N))
+    R  = rfft(rp); Q = rfft(qp)
+    xc = irfft(conj.(R) .* Q, n)
+
+    norm = sqrt(sum(abs2, r) * sum(abs2, q))
+    max_lag = clamp(max_lag, 1, n ÷ 2 - 1)
+
+    # Score every lag in the window
+    lags = collect(-max_lag:max_lag)
+    vals = Vector{Float64}(undef, length(lags))
+    @inbounds for (i, lag) in enumerate(lags)
+        idx = lag >= 0 ? lag + 1 : n + lag + 1
+        vals[i] = norm == 0 ? 0.0 : xc[idx] / norm
+    end
+
+    # Greedy top-K with spacing constraint
+    order = sortperm(vals; rev = true)
+    selected = Tuple{Int,Float64}[]
+    for j in order
+        lag = lags[j]; val = vals[j]
+        if all(abs(lag - sel[1]) >= min_spacing for sel in selected)
+            push!(selected, (lag, val))
+            length(selected) >= k && break
+        end
+    end
+    return selected
+end
+
+"""
+    rolling_mean(x, window) -> Vector{Float64}
+
+Symmetric centred rolling mean, computed in one pass via cumulative sum.
+Used to flatten lap-periodic structure (~54 s) before FFT cross-correlation
+so the global offset peak isn't aliased onto lap-multiple sub-peaks.
+"""
+function rolling_mean(x::AbstractVector{<:Real}, window::Int)
+    n = length(x)
+    out = Vector{Float64}(undef, n)
+    n == 0 && return out
+    safe = [isnan(v) ? 0.0 : Float64(v) for v in x]
+    cs = cumsum(safe)
+    half = window ÷ 2
+    @inbounds for i in 1:n
+        lo = max(1, i - half)
+        hi = min(n, i + half)
+        s  = cs[hi] - (lo > 1 ? cs[lo - 1] : 0.0)
+        out[i] = s / (hi - lo + 1)
+    end
+    return out
 end
 
 """
@@ -199,91 +281,180 @@ function find_audio_active_start(video_path::AbstractString;
 end
 
 """
-    align_audio_rpm(video_path, arrow_path;
-                    band=(200,800), env_hz=50,
-                    window_s=600.0, max_lag_s=600.0,
-                    audio_sr=4000, rms_threshold=0.005) -> NamedTuple
+    audio_rpm_trace(audio, sr; window_size=2048, hop=200,
+                    freq_band_hz=(300,800), cylinders=8) -> NamedTuple
 
-Two-stage alignment:
+Extract an RPM-from-audio trace by tracking the firing fundamental in a
+short-time Fourier transform. For a 4-stroke engine:
 
-1. `find_race_start` on RPM finds the green flag in telemetry time.
-   `find_audio_active_start` finds when the in-car camera audio actually
-   becomes loud (its mic is often muted during pre-race).
-2. A `window_s` slice is placed at the **later** of those two events, so
-   both signals are actively varying. The RPM envelope is FFT-cross-
-   correlated against a wider audio chunk to find the lag.
+    firing_freq_hz = RPM / 60 × cylinders / 2
+    → RPM = freq × 120 / cylinders
 
-Returns `(offset_s, confidence, ...)` where
-`telemetry_time ≈ video_time + offset_s`.
+For NASCAR Cup V8 (cylinders=8): RPM = freq × 15. Racing RPM 6000–9000 maps
+to fundamental 400–600 Hz; the default band `(300, 800)` covers that with
+margin for caution-lap RPMs without slipping into 2nd-harmonic territory.
+
+Returns `(rpm, energy, frame_hz)` — energy per frame is the in-band power,
+used to mask quiet (silent or out-of-band) frames before correlation.
 """
+function audio_rpm_trace(audio::AbstractVector{<:Real}, sr::Int;
+                         window_size::Int = 2048,
+                         hop::Int = 200,
+                         freq_band_hz::Tuple{Real,Real} = (300.0, 800.0),
+                         cylinders::Int = 8)
+    rpm_per_hz = 120.0 / cylinders
+    bin_hz     = sr / window_size
+    lo_bin     = max(2, round(Int, freq_band_hz[1] / bin_hz) + 1)
+    hi_bin     = min(window_size ÷ 2, round(Int, freq_band_hz[2] / bin_hz) + 1)
+
+    n = length(audio)
+    n_frames = max(0, (n - window_size) ÷ hop + 1)
+    n_frames == 0 && return (rpm = Float64[], energy = Float64[], frame_hz = sr / hop)
+
+    # Hann window
+    win = [0.5 - 0.5 * cos(2π * (i - 1) / (window_size - 1)) for i in 1:window_size]
+    buf  = Vector{Float64}(undef, window_size)
+    plan = plan_rfft(buf)
+
+    rpm_trace = Vector{Float64}(undef, n_frames)
+    energy    = Vector{Float64}(undef, n_frames)
+
+    @inbounds for k in 1:n_frames
+        s = (k - 1) * hop + 1
+        for i in 1:window_size
+            buf[i] = Float64(audio[s + i - 1]) * win[i]
+        end
+        S = plan * buf
+
+        peak_bin = lo_bin
+        peak_mag = abs2(S[lo_bin])
+        e = 0.0
+        for b in lo_bin:hi_bin
+            m = abs2(S[b])
+            e += m
+            if m > peak_mag
+                peak_mag = m
+                peak_bin = b
+            end
+        end
+
+        # Parabolic interpolation around the peak for sub-bin precision
+        if peak_bin > lo_bin && peak_bin < hi_bin
+            y0 = log(abs2(S[peak_bin - 1]) + 1e-30)
+            y1 = log(peak_mag + 1e-30)
+            y2 = log(abs2(S[peak_bin + 1]) + 1e-30)
+            denom = (y0 - 2 * y1 + y2)
+            delta = abs(denom) < 1e-12 ? 0.0 : 0.5 * (y0 - y2) / denom
+            peak_freq = (peak_bin - 1 + clamp(delta, -1.0, 1.0)) * bin_hz
+        else
+            peak_freq = (peak_bin - 1) * bin_hz
+        end
+        rpm_trace[k] = peak_freq * rpm_per_hz
+        energy[k]    = e
+    end
+
+    return (rpm = rpm_trace, energy = energy, frame_hz = sr / hop)
+end
+
+"""
+    active_boundaries(signal, smooth_window_frames, threshold) -> (start, end)
+
+Find the indices where a signal first rises above and last falls below
+`threshold`, after smoothing with a centred rolling mean. Smoothing kills
+per-lap dips so we recover the SESSION-level active span (engine started →
+engine stopped). Returns `(0, 0)` if nothing exceeds threshold.
+"""
+function active_boundaries(signal::AbstractVector{<:Real},
+                           smooth_window_frames::Int,
+                           threshold::Real)
+    sm = rolling_mean(signal, smooth_window_frames)
+    s  = findfirst(>(threshold), sm)
+    e  = findlast(>(threshold), sm)
+    s === nothing && return (0, 0)
+    return (s, e)
+end
+
 function align_audio_rpm(video_path::AbstractString,
                          arrow_path::AbstractString;
-                         band::Tuple{Real,Real} = (200.0, 800.0),
-                         env_hz::Int = 50,
-                         window_s::Real = 600.0,
-                         max_lag_s::Real = 600.0,
+                         band::Tuple{Real,Real} = (300.0, 800.0),
                          audio_sr::Int = 4000,
-                         rms_threshold::Real = 0.005)
-    tel = load_telemetry(arrow_path)
-    t1_tel = Float64(tel.time[end])
+                         window_size::Int = 2048,
+                         hop::Int = 200,
+                         cylinders::Int = 8,
+                         max_lag_s::Real = 1800.0,
+                         energy_pctile::Real = 0.4,
+                         k_candidates::Int = 12,
+                         disambiguation_tol_s::Real = 60.0,
+                         backend::FfmpegBackend = detect_backend())
+    tel    = load_telemetry(arrow_path)
+    t0_tel = Float64(tel.time[1])
 
-    race_idx        = find_race_start(tel.rpm)
-    race_t_tel      = Float64(tel.time[race_idx])
-    audio_active_t  = find_audio_active_start(video_path;
-                                              sr = audio_sr,
-                                              rms_threshold = rms_threshold)
+    audio = extract_audio_mono(video_path; sr = audio_sr, backend = backend)
+    a     = audio_rpm_trace(audio, audio_sr;
+                            window_size = window_size, hop = hop,
+                            freq_band_hz = band, cylinders = cylinders)
+    frame_hz = a.frame_hz
 
-    # Coarse seed: assume telemetry's race-start event and the video's
-    # audio-active event are the same physical moment (engines firing).
-    # offset_s_seed = telemetry_time - video_time at that moment.
-    seed_offset_s = race_t_tel - audio_active_t
+    # Mask low-energy frames (silent / muted / out-of-band).
+    e_thresh   = quantile(a.energy, energy_pctile)
+    audio_rpm  = Float64[a.energy[i] >= e_thresh ? a.rpm[i] : 0.0
+                         for i in eachindex(a.rpm)]
 
-    # Place telemetry window safely inside the loud region (add a small pad
-    # past race start so we're past the launch ramp).
-    win_start_t = race_t_tel + 30.0
-    win_end_t   = min(t1_tel, win_start_t + window_s)
+    tel_rpm = rpm_proxy_signal(tel.time, tel.rpm; env_sr = round(Int, frame_hz))
 
-    # Align the video window so xcorr only needs to find a small refinement
-    # to the seed offset. video_time_corresponding_to_win_start =
-    # win_start_t - seed_offset_s. Pad ±max_lag_s.
-    video_start = max(0.0, (win_start_t - seed_offset_s) - max_lag_s)
-    video_dur   = (win_end_t - win_start_t) + 2 * max_lag_s
+    # ─── Stage 1: short-list candidates from FFT cross-correlation ───
+    # Top-K peaks, spaced ≥ 30 s apart so we don't grab a cluster of samples
+    # around the same lobe. The TRUE peak should be in this list; lap-period
+    # aliased copies of it will be in there too.
+    max_lag     = round(Int, max_lag_s * frame_hz)
+    min_spacing = round(Int, 30.0 * frame_hz)
+    peaks = fft_xcorr_top_k(tel_rpm, audio_rpm, max_lag;
+                            k = k_candidates, min_spacing = min_spacing)
 
-    audio = extract_audio_mono(video_path;
-                               start_s = video_start,
-                               duration_s = video_dur,
-                               sr = audio_sr)
-    env_a, _ = audio_firing_envelope(audio, audio_sr; band = band, env_hz = env_hz)
+    # ─── Stage 2: session-level seed via boolean-signal xcorr ───
+    # Convert both signals to a binary "is-racing" indicator (smoothed RPM
+    # crosses 5000). The resulting signal has a unique global SHAPE — silent
+    # → racing → quiet — with cautions that don't repeat at a fixed lap
+    # period, so the FFT cross-correlation of the booleans peaks sharply at
+    # the true offset, free of lap-period aliasing.
+    smooth_win   = round(Int, 10.0 * frame_hz)
+    tel_racing   = Float64[v > 5000.0 ? 1.0 : 0.0 for v in rolling_mean(tel_rpm,   smooth_win)]
+    audio_racing = Float64[v > 5000.0 ? 1.0 : 0.0 for v in rolling_mean(audio_rpm, smooth_win)]
+    seed_k, seed_conf = fft_xcorr_lag(tel_racing, audio_racing, max_lag)
+    session_offset_s = t0_tel - seed_k / frame_hz
+    have_session_seed = seed_conf > 0.1
 
-    # Telemetry envelope at env_hz over the same telemetry window
-    i0 = searchsortedfirst(tel.time, win_start_t)
-    i1 = searchsortedlast(tel.time,  win_end_t)
-    env_r = rpm_proxy_signal(view(tel.time, i0:i1),
-                             view(tel.rpm,  i0:i1); env_sr = env_hz)
+    tol_frames = round(Int, disambiguation_tol_s * frame_hz)
+    session_lag_frames = Float64(seed_k)
 
-    max_lag = round(Int, max_lag_s * env_hz)
-    best_k, conf = fft_xcorr_lag(env_r, env_a, max_lag)
+    # ─── Stage 3: pick the highest-xcorr peak within tolerance of seed ───
+    selected = nothing
+    if have_session_seed
+        for (lag, val) in peaks
+            if abs(lag - session_lag_frames) <= tol_frames
+                selected = (lag, val); break
+            end
+        end
+    end
+    fallback = selected === nothing
+    fallback && (selected = peaks[1])
 
-    # env_r covers [win_start_t,   win_end_t]                (telemetry clock)
-    # env_a covers [video_start,   video_start+video_dur]    (video clock)
-    # xcorr(env_r, env_a) peak at best_k means env_r[i] ↔ env_a[i+best_k].
-    # So the same physical moment is at:
-    #     telemetry time = win_start_t + i / env_hz
-    #     video time     = video_start + (i + best_k) / env_hz
-    # offset_s = telemetry - video
-    offset_s = (win_start_t - video_start) - best_k / env_hz
+    best_k = selected[1]
+    conf   = selected[2]
+    offset_s = t0_tel - best_k / frame_hz
 
     return (
-        offset_s          = offset_s,
-        confidence        = conf,
-        lag_samples       = best_k,
-        env_hz            = env_hz,
-        race_start_tel_s  = race_t_tel,
-        audio_active_vid_s = audio_active_t,
-        seed_offset_s     = seed_offset_s,
-        refinement_s      = offset_s - seed_offset_s,
-        tel_window        = (win_start_t, win_end_t),
-        video_window      = (video_start, video_start + video_dur),
-        method            = :fft_xcorr_focused,
+        offset_s         = offset_s,
+        confidence       = conf,
+        lag_samples      = best_k,
+        frame_hz         = frame_hz,
+        active_frames    = count(>(e_thresh), a.energy),
+        total_frames     = length(a.energy),
+        session_offset_s = session_offset_s,
+        session_seed_ok  = have_session_seed,
+        used_fallback    = fallback,
+        candidate_peaks  = [(lag = lag, offset_s = t0_tel - lag / frame_hz, conf = val)
+                            for (lag, val) in peaks],
+        method           = :spectral_xcorr_session_disambiguated,
     )
 end

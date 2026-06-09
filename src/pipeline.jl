@@ -30,7 +30,7 @@ function generate_lap_video(video_path::AbstractString,
                             event_label::AbstractString  = "",
                             fps::Int = 25,
                             resolution::Tuple{Int,Int} = (1280, 720),
-                            audio_alignment::Union{Symbol,Real} = :seed,
+                            audio_alignment::Union{Symbol,Real} = _config_alignment(),
                             ranges = default_ranges(),
                             encoder::Symbol = :auto,
                             progress::Union{Nothing,Function} = nothing)
@@ -172,6 +172,24 @@ function generate_lap_video(video_path::AbstractString,
     )
 end
 
+"""
+    _config_alignment() -> Union{Symbol,Float64}
+
+Read `[defaults].audio_alignment` from the TOML config. Numbers come back
+as Float64, strings are parsed (numeric strings → Float64, other strings →
+Symbol). Falls back to `:seed`.
+"""
+function _config_alignment()
+    v = config_get("defaults", "audio_alignment", :seed)
+    v isa Symbol     && return v
+    v isa Real       && return Float64(v)
+    if v isa AbstractString
+        n = tryparse(Float64, v)
+        return n === nothing ? Symbol(v) : n
+    end
+    return :seed
+end
+
 function _require_file(path::AbstractString, kind::AbstractString, env_var::AbstractString)
     isfile(path) && return
     hint = haskey(ENV, env_var) ?
@@ -270,7 +288,11 @@ function generate_lap_video_json(config::AbstractDict)
     return Dict(string(k) => _to_json_value(v) for (k, v) in pairs(result))
 end
 
-_maybe_symbol(v::AbstractString) = startswith(v, ":") ? Symbol(v[2:end]) : v
+function _maybe_symbol(v::AbstractString)
+    startswith(v, ":") && return Symbol(v[2:end])
+    n = tryparse(Float64, v)
+    return n === nothing ? v : n
+end
 _maybe_symbol(v::Symbol) = v
 _maybe_symbol(v::Real) = Float64(v)
 _maybe_symbol(v) = v
