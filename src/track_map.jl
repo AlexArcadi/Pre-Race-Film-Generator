@@ -80,12 +80,40 @@ function load_track_map(db_path::AbstractString, track_hint::AbstractString)
     entry = db[Symbol(key)]
     x = Float64.(collect(entry[:x]))
     y = Float64.(collect(entry[:y]))
-    s = Float64.(collect(entry[:s]))
+
+    s = if haskey(entry, :s)
+        Float64.(collect(entry[:s]))
+    else
+        _arc_length(x, y, haskey(entry, :total_dist_ft) ? Float64(entry[:total_dist_ft]) : nothing)
+    end
+
     total = haskey(entry, :total_dist_ft) ? Float64(entry[:total_dist_ft]) : Float64(s[end])
     xmin, xmax = extrema(x); ymin, ymax = extrema(y)
     xn = (x .- xmin) ./ (xmax - xmin)
     yn = (y .- ymin) ./ (ymax - ymin)
-    return TrackMap(key, x, y, s, total, xn, yn)
+    return TrackMap(String(key), x, y, s, total, xn, yn)
+end
+
+"""
+    _arc_length(x, y, total_dist_ft=nothing) -> Vector{Float64}
+
+Cumulative point-to-point Euclidean distance along (x, y). If `total_dist_ft`
+is given, the result is scaled so the final value equals it (handles tracks
+where x,y are in arbitrary units, not feet).
+"""
+function _arc_length(x::AbstractVector{<:Real}, y::AbstractVector{<:Real},
+                     total_dist_ft::Union{Nothing,Real} = nothing)
+    n = length(x)
+    s = Vector{Float64}(undef, n)
+    s[1] = 0.0
+    @inbounds for i in 2:n
+        s[i] = s[i-1] + hypot(x[i] - x[i-1], y[i] - y[i-1])
+    end
+    if total_dist_ft !== nothing && s[end] > 0
+        scale = Float64(total_dist_ft) / s[end]
+        s .*= scale
+    end
+    return s
 end
 
 """
