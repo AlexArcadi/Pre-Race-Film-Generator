@@ -10,6 +10,7 @@ include("race.jl")
 include("track_map.jl")
 include("alignment.jl")
 include("render.jl")
+include("render_minimal.jl")
 include("pipeline.jl")
 
 export detect_laps,
@@ -44,6 +45,7 @@ export detect_laps,
        car_override,
        event_label_default,
        list_cars,
-       find_car_session
+       find_car_session,
+       build_channels_minimal
 
 end # module
