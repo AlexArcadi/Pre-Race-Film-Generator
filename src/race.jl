@@ -282,7 +282,6 @@ function render_lap(cfg::RaceConfig, car::Integer, lap::Integer;
         output_path  = out,
         driver_label = driver_label,
         event_label  = event_label,
-        car_number   = Int(car),
         kwargs...)
 end
 

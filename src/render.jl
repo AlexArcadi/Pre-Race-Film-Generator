@@ -239,8 +239,7 @@ function draw_dynamic!(cr, layout::OverlayLayout,
                        cur_norms::Vector{Float64},
                        tm,                       # ::Union{Nothing,TrackMap}
                        cur_dist::Float64,
-                       lap_time_s::Float64;
-                       skip_track_marker::Bool = false)
+                       lap_time_s::Float64)
     nch = length(channels)
     row_h = layout.bot_h / nch
     pad   = row_h * 0.075
@@ -271,7 +270,7 @@ function draw_dynamic!(cr, layout::OverlayLayout,
     end
 
     # Track-map dot
-    if tm !== nothing && !skip_track_marker
+    if tm !== nothing
         margin = 10
         tw = layout.map_w - 2 * margin
         th = layout.top_h - 2 * margin

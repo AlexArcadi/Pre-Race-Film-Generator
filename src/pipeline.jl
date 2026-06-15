@@ -35,7 +35,6 @@ function generate_lap_video(video_path::AbstractString,
                             ranges = default_ranges(),
                             encoder::Symbol = :auto,
                             template::Symbol = :full,
-                            car_number::Union{Nothing,Integer} = nothing,
                             progress::Union{Nothing,Function} = nothing)
     _require_file(video_path, "video", "PRERACEFILM_DATA_DIR")
     _require_file(arrow_path, "arrow", "PRERACEFILM_ARROW_DIR")
@@ -90,7 +89,9 @@ function generate_lap_video(video_path::AbstractString,
     # Build channels + normalised time
     channels = template === :minimal ?
         build_channels_minimal(tel, lap_rows, ranges) :
-        build_channels(tel, lap_rows, ranges)
+        template === :full ?
+            build_channels(tel, lap_rows, ranges) :
+            error("Unknown template: $template (expected :full or :minimal)")
     t_raw    = Float64.(view(tel.time, lap_rows))
     t_norm   = (t_raw .- t_raw[1]) ./ (t_raw[end] - t_raw[1])
     lap_fracs = Float64.(view(tel.lap_frac, lap_rows))
@@ -101,10 +102,6 @@ function generate_lap_video(video_path::AbstractString,
 
     static_surface = bake_static_surface(layout, channels, t_norm,
                                           track_surface, driver_label, event_label)
-
-    # Minimal template: load the car-number icon once for the per-frame overlay.
-    car_icon = (template === :minimal && car_number !== nothing && tm !== nothing) ?
-        load_car_icon_surface(backend, Int(car_number)) : nothing
 
     # Prepare frame buffer
     frame_surf = CairoARGBSurface(layout.W, layout.H)
@@ -158,11 +155,7 @@ function generate_lap_video(video_path::AbstractString,
 
             blit_surface!(frame_surf, static_surface)
             draw_dynamic!(cr, layout, channels, tq, cur_vals, cur_norms,
-                          tm, cur_dist, lap_t;
-                          skip_track_marker = car_icon !== nothing)
-            if car_icon !== nothing
-                draw_car_icon_on_map!(cr, layout, tm, cur_dist, car_icon)
-            end
+                          tm, cur_dist, lap_t)
             Cairo.flush(frame_surf)
             write(proc, raw_rgba)
 
@@ -187,6 +180,7 @@ function generate_lap_video(video_path::AbstractString,
         track_key       = track_key,
         encoder         = backend.encoder,
         ffmpeg_backend  = backend.use_system ? :system : :bundled,
+        template        = template,
         alignment       = align_meta,
     )
 end
@@ -301,6 +295,7 @@ function generate_lap_video_json(config::AbstractDict)
     haskey(config, "resolution")      && (kwargs[:resolution]      = Tuple{Int,Int}(config["resolution"]))
     haskey(config, "audio_alignment") && (kwargs[:audio_alignment] = _maybe_symbol(config["audio_alignment"]))
     haskey(config, "encoder")         && (kwargs[:encoder]         = Symbol(config["encoder"]))
+    haskey(config, "template")        && (kwargs[:template]        = Symbol(config["template"]))
 
     result = generate_lap_video(video_path, arrow_path, lap_number;
                                 output_path = output_path, kwargs...)
