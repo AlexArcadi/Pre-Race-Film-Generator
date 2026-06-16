@@ -47,6 +47,7 @@ export detect_laps,
        list_cars,
        find_car_session,
        build_channels_minimal,
-       build_stats_minimal
+       build_stats_minimal,
+       load_car_number_graphic
 
 end # module

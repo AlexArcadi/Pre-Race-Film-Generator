@@ -44,6 +44,7 @@ function generate_lap_video(video_path::AbstractString,
                             ranges = default_ranges(),
                             encoder::Symbol = :auto,
                             template::Symbol = :full,
+                            car_number::Union{Nothing,Integer} = nothing,
                             progress::Union{Nothing,Function} = nothing)
     _require_file(video_path, "video", "PRERACEFILM_DATA_DIR")
     _require_file(arrow_path, "arrow", "PRERACEFILM_ARROW_DIR")
@@ -118,6 +119,14 @@ function generate_lap_video(video_path::AbstractString,
         bake_static_surface(layout, channels, t_norm,
                             track_surface, driver_label, event_label)
 
+    # Car-number graphic for the track-map marker (minimal template only).
+    car_graphic = nothing
+    if template === :minimal && car_number !== nothing && tm !== nothing
+        car_graphic = load_car_number_graphic(car_number, CAR_NUMBER_GRAPHIC_H, backend)
+        car_graphic === nothing &&
+            @warn "No car-number graphic found for car #$car_number — falling back to dot."
+    end
+
     # Prepare frame buffer
     frame_surf = CairoARGBSurface(layout.W, layout.H)
     cr = CairoContext(frame_surf)
@@ -175,7 +184,8 @@ function generate_lap_video(video_path::AbstractString,
             blit_surface!(frame_surf, static_surface)
             if template === :minimal
                 draw_dynamic_minimal!(cr, layout, channels, tq, cur_vals, cur_norms,
-                                      tm, cur_dist, lap_t, stats, cur_stat_vals)
+                                      tm, cur_dist, lap_t, stats, cur_stat_vals,
+                                      car_graphic)
             else
                 draw_dynamic!(cr, layout, channels, tq, cur_vals, cur_norms,
                               tm, cur_dist, lap_t)

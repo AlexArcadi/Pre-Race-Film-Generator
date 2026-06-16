@@ -13,6 +13,106 @@ const CH_ORDER_MINIMAL = (:THROTTLE, :BRAKE, :STEERING)
 const STAT_ORDER_MINIMAL = (:MPH, :RPM, :GEAR)
 const STAT_W_MINIMAL = 130    # right-side stat column width, px
 const VAL_W_MINIMAL  = 95     # value column width (overrides layout.val_w for minimal)
+const CAR_NUMBER_GRAPHIC_H = 36   # car-number graphic height on the track map, px
+
+# Cache decoded car-number surfaces so multi-lap renders don't re-decode.
+const _CAR_NUMBER_CACHE = Dict{Tuple{Int,Int}, Cairo.CairoSurface}()
+_car_number_dir() = joinpath(dirname(@__DIR__), "NCS Car Number Graphics")
+
+function _find_car_number_file(num::Integer)
+    folder = joinpath(_car_number_dir(), string(Int(num)))
+    isdir(folder) || return nothing
+    for f in readdir(folder)
+        lf = lowercase(f)
+        (endswith(lf, ".jpg") || endswith(lf, ".jpeg") || endswith(lf, ".png")) &&
+            return joinpath(folder, f)
+    end
+    return nothing
+end
+
+"""
+    load_car_number_graphic(num, height, backend) -> Union{Nothing, CairoSurface}
+
+Decode `NCS Car Number Graphics/<num>/<file>` via ffmpeg at the requested
+height (width auto from aspect ratio), then flood-fill near-white pixels
+that are border-connected to transparent. Interior white (the number's
+own fill) is preserved because the flood fill seeds only on the edges.
+Returns nothing if the folder or file is missing. Cached by (num, height).
+"""
+function load_car_number_graphic(num::Integer,
+                                 height::Int = CAR_NUMBER_GRAPHIC_H,
+                                 backend = detect_backend())
+    key = (Int(num), height)
+    haskey(_CAR_NUMBER_CACHE, key) && return _CAR_NUMBER_CACHE[key]
+    path = _find_car_number_file(num)
+    path === nothing && return nothing
+
+    bytes = with_backend(backend) do exe
+        args = String[exe, "-hide_banner", "-loglevel", "error",
+                      "-i", String(path),
+                      "-vf", "scale=-2:$height",
+                      "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"]
+        read(Cmd(args))
+    end
+    isempty(bytes) && return nothing
+    px_total = length(bytes) ÷ 4
+    W = px_total ÷ height
+    W * height == px_total || return nothing
+
+    surf = Cairo.CairoARGBSurface(W, height)
+    buf  = argbuffer(surf)
+    copyto!(buf, reinterpret(UInt32, bytes))
+    _floodfill_white_to_transparent!(buf, W, height)
+    Cairo.mark_dirty(surf)   # we wrote pixels directly; force Cairo to re-read on next source use
+    _CAR_NUMBER_CACHE[key] = surf
+    return surf
+end
+
+# Cairo ARGB32 on little-endian: byte 0 = B, 1 = G, 2 = R, 3 = A.
+# Threshold 0xF0 (240) tolerates JPG compression noise around the white bg.
+function _floodfill_white_to_transparent!(px::AbstractVector{UInt32}, W::Int, H::Int;
+                                          threshold::UInt8 = 0xF0)
+    is_near_white(p::UInt32) =
+        UInt8(p          & 0xFF) >= threshold &&
+        UInt8((p >> 8)   & 0xFF) >= threshold &&
+        UInt8((p >> 16)  & 0xFF) >= threshold
+
+    n = W * H
+    visited = falses(n)
+    stack = Int[]
+    sizehint!(stack, max(64, n ÷ 4))
+
+    @inline function seed!(i::Int)
+        @inbounds if !visited[i] && is_near_white(px[i])
+            visited[i] = true
+            push!(stack, i)
+        end
+    end
+
+    for x in 1:W
+        seed!(x)
+        seed!((H - 1) * W + x)
+    end
+    for y in 1:H
+        seed!((y - 1) * W + 1)
+        seed!((y - 1) * W + W)
+    end
+
+    while !isempty(stack)
+        i = pop!(stack)
+        x = (i - 1) % W + 1
+        y = (i - 1) ÷ W + 1
+        x > 1 && seed!(i - 1)
+        x < W && seed!(i + 1)
+        y > 1 && seed!(i - W)
+        y < H && seed!(i + W)
+    end
+
+    @inbounds for i in 1:n
+        visited[i] && (px[i] = UInt32(0))
+    end
+    return px
+end
 
 """
     build_channels_minimal(tel, lap_rows, ranges) -> Vector{ChannelTrace}
@@ -209,7 +309,8 @@ function draw_dynamic_minimal!(cr, layout::OverlayLayout,
                                cur_dist::Float64,
                                lap_time_s::Float64,
                                stats::Vector{ChannelTrace},
-                               cur_stat_vals::Vector{Float64})
+                               cur_stat_vals::Vector{Float64},
+                               car_graphic::Union{Nothing,Cairo.CairoSurface} = nothing)
     trace_w = _minimal_trace_w(layout)
     val_x   = _minimal_val_x(layout)
     stat_x  = _minimal_stat_x(layout)
@@ -277,11 +378,21 @@ function draw_dynamic_minimal!(cr, layout::OverlayLayout,
         xn, yn = dist_to_map_norm(cur_dist, tm)
         px = layout.vid_w + margin + (inset + xn * (1 - 2 * inset)) * tw
         py = margin + (1 - (inset + yn * (1 - 2 * inset))) * th
-        set_rgb!(cr, colorant"#ffee00")
-        arc(cr, px, py, 6.0, 0, 2π); fill(cr)
-        set_rgb!(cr, colorant"white")
-        set_line_width(cr, 1.0)
-        arc(cr, px, py, 6.0, 0, 2π); stroke(cr)
+        if car_graphic !== nothing
+            gw = Float64(Cairo.width(car_graphic))
+            gh = Float64(Cairo.height(car_graphic))
+            save(cr)
+            translate(cr, px - gw / 2, py - gh / 2)
+            set_source_surface(cr, car_graphic, 0, 0)
+            paint(cr)
+            restore(cr)
+        else
+            set_rgb!(cr, colorant"#ffee00")
+            arc(cr, px, py, 6.0, 0, 2π); fill(cr)
+            set_rgb!(cr, colorant"white")
+            set_line_width(cr, 1.0)
+            arc(cr, px, py, 6.0, 0, 2π); stroke(cr)
+        end
     end
 
     select_font_face(cr, "monospace", Cairo.FONT_SLANT_NORMAL, Cairo.FONT_WEIGHT_BOLD)
