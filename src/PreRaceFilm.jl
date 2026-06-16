@@ -46,6 +46,7 @@ export detect_laps,
        event_label_default,
        list_cars,
        find_car_session,
-       build_channels_minimal
+       build_channels_minimal,
+       build_stats_minimal
 
 end # module

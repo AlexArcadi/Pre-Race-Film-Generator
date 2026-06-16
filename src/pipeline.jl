@@ -92,6 +92,9 @@ function generate_lap_video(video_path::AbstractString,
         template === :full ?
             build_channels(tel, lap_rows, ranges) :
             error("Unknown template: $template (expected :full or :minimal)")
+    stats = template === :minimal ?
+        build_stats_minimal(tel, lap_rows, ranges) :
+        ChannelTrace[]
     t_raw    = Float64.(view(tel.time, lap_rows))
     t_norm   = (t_raw .- t_raw[1]) ./ (t_raw[end] - t_raw[1])
     lap_fracs = Float64.(view(tel.lap_frac, lap_rows))
@@ -100,8 +103,11 @@ function generate_lap_video(video_path::AbstractString,
     track_dist = tm === nothing ? zeros(Float64, length(lap_fracs)) :
         ((lap_fracs .- floor.(lap_fracs)) .* tm.total_dist_ft)
 
-    static_surface = bake_static_surface(layout, channels, t_norm,
-                                          track_surface, driver_label, event_label)
+    static_surface = template === :minimal ?
+        bake_static_surface_minimal(layout, channels, t_norm, track_surface,
+                                    driver_label, event_label, stats) :
+        bake_static_surface(layout, channels, t_norm,
+                            track_surface, driver_label, event_label)
 
     # Prepare frame buffer
     frame_surf = CairoARGBSurface(layout.W, layout.H)
@@ -137,6 +143,7 @@ function generate_lap_video(video_path::AbstractString,
     try
         cur_vals = Vector{Float64}(undef, length(channels))
         cur_norms = Vector{Float64}(undef, length(channels))
+        cur_stat_vals = Vector{Float64}(undef, length(stats))
         nrows = length(lap_rows)
 
         for i in 0:(total_frames - 1)
@@ -149,13 +156,21 @@ function generate_lap_video(video_path::AbstractString,
                 cur_vals[k]  = ch.data[i0] * (1 - frac) + ch.data[i0 + 1] * frac
                 cur_norms[k] = ch.norm[i0] * (1 - frac) + ch.norm[i0 + 1] * frac
             end
+            for (k, st) in enumerate(stats)
+                cur_stat_vals[k] = st.data[i0] * (1 - frac) + st.data[i0 + 1] * frac
+            end
             cur_dist = tm === nothing ? 0.0 :
                 track_dist[i0] * (1 - frac) + track_dist[i0 + 1] * frac
             lap_t = tq * lap_dur
 
             blit_surface!(frame_surf, static_surface)
-            draw_dynamic!(cr, layout, channels, tq, cur_vals, cur_norms,
-                          tm, cur_dist, lap_t)
+            if template === :minimal
+                draw_dynamic_minimal!(cr, layout, channels, tq, cur_vals, cur_norms,
+                                      tm, cur_dist, lap_t, stats, cur_stat_vals)
+            else
+                draw_dynamic!(cr, layout, channels, tq, cur_vals, cur_norms,
+                              tm, cur_dist, lap_t)
+            end
             Cairo.flush(frame_surf)
             write(proc, raw_rgba)
 
