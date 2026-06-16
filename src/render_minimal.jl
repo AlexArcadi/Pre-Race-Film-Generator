@@ -12,6 +12,7 @@
 const CH_ORDER_MINIMAL = (:THROTTLE, :BRAKE, :STEERING)
 const STAT_ORDER_MINIMAL = (:MPH, :RPM, :GEAR)
 const STAT_W_MINIMAL = 130    # right-side stat column width, px
+const VAL_W_MINIMAL  = 95     # value column width (overrides layout.val_w for minimal)
 
 """
     build_channels_minimal(tel, lap_rows, ranges) -> Vector{ChannelTrace}
@@ -63,9 +64,9 @@ end
 
 # Effective trace width when the stat column is on: traces end earlier
 # so the value column + stat column fit on the right.
-_minimal_trace_w(layout::OverlayLayout) = layout.W - layout.val_w - STAT_W_MINIMAL
+_minimal_trace_w(layout::OverlayLayout) = layout.W - VAL_W_MINIMAL - STAT_W_MINIMAL
 _minimal_val_x(layout::OverlayLayout)   = _minimal_trace_w(layout)
-_minimal_stat_x(layout::OverlayLayout)  = _minimal_trace_w(layout) + layout.val_w
+_minimal_stat_x(layout::OverlayLayout)  = _minimal_trace_w(layout) + VAL_W_MINIMAL
 
 """
     bake_static_surface_minimal(layout, channels, t_norm, track_bg,
@@ -94,7 +95,7 @@ function bake_static_surface_minimal(layout::OverlayLayout,
     # Telemetry strip background
     paint_rect!(cr, 0, layout.top_h, layout.W, layout.bot_h, colorant"#111111")
     # Value column (re-uses #111111, kept for intent)
-    paint_rect!(cr, val_x, layout.top_h, layout.val_w, layout.bot_h, colorant"#111111")
+    paint_rect!(cr, val_x, layout.top_h, VAL_W_MINIMAL, layout.bot_h, colorant"#111111")
     # Stat column slightly darker
     paint_rect!(cr, stat_x, layout.top_h, STAT_W_MINIMAL, layout.bot_h, colorant"#0a0a0a")
 

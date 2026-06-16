@@ -19,6 +19,15 @@ Top-level entry point. Detects the requested lap in the arrow file, aligns
 the video to telemetry via audio↔RPM cross-correlation (unless overridden),
 trims the source clip, renders overlay frames with Cairo, and pipes
 everything through a single ffmpeg invocation to produce `output_path`.
+
+RUNNING SCRIPT:
+- Play pipeline.jl
+- paste into REPL: using Pkg; Pkg.activate(".")
+- paste into REPL: using PreRaceFilm
+- Play render_minimal.jl or render_full.jl to generate videos with different overlay templates.
+- paste into REPL: const CFG = getConfig()
+- paste into REPL: process(CFG; cars = [9], laps = [70], template = :minimal)
+
 """
 function generate_lap_video(video_path::AbstractString,
                             arrow_path::AbstractString,
@@ -31,7 +40,7 @@ function generate_lap_video(video_path::AbstractString,
                             fps::Int = 25,
                             resolution::Tuple{Int,Int} = (1280, 720),
                             audio_alignment::Union{Symbol,Real} = _config_alignment(),
-                            fine_tune_s::Real = 0.0,
+                            fine_tune_s::Real = -.70,
                             ranges = default_ranges(),
                             encoder::Symbol = :auto,
                             template::Symbol = :full,
