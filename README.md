@@ -1,10 +1,11 @@
 # Pre-Race Film Generator
 
-Julia pipeline that takes a session-length in-car video (`.mpg`) + ERDP
-telemetry (`.arrow`), aligns them by audio↔RPM correlation, trims to a
-chosen lap, and renders a 1280×720 H.264 overlay video showing the track
-map, six telemetry traces (MPH, RPM, GEAR, THROTTLE, BRAKE, STEERING) and
-their current values.
+Julia pipeline that takes a session-length in-car video (`.mpg`/`.mp4`) + ERDP
+telemetry (`.arrow`), aligns them — by audio↔RPM correlation **or**, for feeds
+with no usable engine audio, by camera-rotation↔gyro correlation from the video
+itself — trims to a chosen lap, and renders a 1280×720 H.264 overlay video
+showing the track map, six telemetry traces (MPH, RPM, GEAR, THROTTLE, BRAKE,
+STEERING) and their current values.
 
 ## Weekly workflow
 
@@ -90,18 +91,34 @@ Check current backend:
 julia --project=. bin/pre_race_film.jl backend
 ```
 
-## Audio↔RPM alignment
+## Alignment
 
-Telemetry and video clocks rarely start together. Three modes:
+Telemetry and video clocks rarely start together. The `audio_alignment` argument
+(`generate_lap_video(...; audio_alignment = …)`) picks the estimator. Sign
+convention: `offset_s` means `telemetry_time = video_time + offset_s`.
 
 | Mode | What it does | When to use |
 |---|---|---|
 | `:seed` *(default)* | `find_race_start(rpm) − find_audio_active_start(video)` | Almost always — fast and robust |
 | `:none` | No shift | Streams are already aligned |
-| `:auto` | FFT cross-correlation of RPM vs firing-band audio envelope | If `:seed` is off and you have clean engine audio |
-| `Float64` | Manual override in seconds | Tuning, or fallback when nothing works |
+| `:auto` | FFT cross-correlation of RPM vs firing-band audio envelope | Clip has clean **engine** audio. Sub-sample refined (parabolic). |
+| `:visual` | Camera yaw/pitch **rate** (phase-correlation on a horizon crop) ↔ chassis gyros `ChassisRotVel{Yaw,Pitch}IDR` | Clip has **no usable engine audio** (e.g. broadcast/radio in-car feeds) |
+| `Float64` | Manual override in seconds | Reuse a known offset, tuning, or fallback |
 
-Pass via `audio_alignment = :seed` (or `:auto`, `:none`, or a number).
+There is no ground truth — validate by **convergence** of methods that don't
+share a failure mode. On Watkins Glen car 16, `:auto` gave −594.0 s and `:visual`
+−594.5 s independently. `:visual` self-checks via `channel_spread_s` (yaw vs
+pitch agreement; ≲0.05 s = a clean lock) and reports a `candidate_peaks` comb —
+on lap-repeating ovals pass a coarse `seed` to pick the right lap; on road
+courses the distinct corners usually make one tooth dominate on their own.
+
+```julia
+# No engine audio (e.g. a dolby/broadcast in-car feed): use the video itself
+generate_lap_video(video, arrow, lap; output_path = out, audio_alignment = :visual)
+
+# Reuse a known offset (skips re-alignment entirely)
+generate_lap_video(video, arrow, lap; output_path = out, audio_alignment = -208.49)
+```
 
 ## Project layout
 
@@ -112,7 +129,8 @@ src/
   telemetry.jl         Arrow load, lap detection, channel binding
   datadir.jl           env-var session library resolution
   track_map.jl         track_map_db.json + position lookup
-  alignment.jl         audio extract, RPM xcorr, seed-based offset
+  alignment.jl         audio extract, RPM xcorr (threaded STFT), seed/auto offset
+  visual_align.jl      camera-rotation↔gyro alignment (the :visual mode)
   render.jl            Cairo overlay compositor
   pipeline.jl          generate_lap_video + JSON helpers
 bin/

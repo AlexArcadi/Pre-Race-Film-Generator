@@ -2,6 +2,7 @@ using DSP
 using FFTW
 using FFMPEG_jll
 using Statistics
+using LinearAlgebra: mul!
 
 """
     extract_audio_mono(video_path; start_s, duration_s, sr=8000,
@@ -136,19 +137,15 @@ function fft_xcorr_lag(ref::AbstractVector{<:Real},
 end
 
 """
-    fft_xcorr_top_k(ref, query, max_lag; k=10, min_spacing=0) -> Vector{Tuple{Int,Float64}}
+    _fft_xcorr_curve(ref, query, max_lag) -> (lags::Vector{Int}, vals::Vector{Float64})
 
-Like `fft_xcorr_lag` but returns the K highest peaks within `|lag| ≤ max_lag`,
-enforcing a minimum lag spacing between selected peaks (so we don't grab a
-cluster of samples around the same peak). Sorted by correlation value
-descending. Used by `align_audio_rpm` to short-list candidates that can be
-disambiguated by session-level features.
+Full normalized cross-correlation curve over `lag ∈ -max_lag:max_lag`. `vals` is
+divided by the global energy norm so it's comparable across lags. Shared core
+of `fft_xcorr_top_k` and the sub-sample refine in `align_audio_rpm`.
 """
-function fft_xcorr_top_k(ref::AbstractVector{<:Real},
-                         query::AbstractVector{<:Real},
-                         max_lag::Int;
-                         k::Int = 10,
-                         min_spacing::Int = 0)
+function _fft_xcorr_curve(ref::AbstractVector{<:Real},
+                          query::AbstractVector{<:Real},
+                          max_lag::Int)
     N = min(length(ref), length(query))
     r = Float64.(view(ref, 1:N))
     q = Float64.(view(query, 1:N))
@@ -163,16 +160,36 @@ function fft_xcorr_top_k(ref::AbstractVector{<:Real},
 
     norm = sqrt(sum(abs2, r) * sum(abs2, q))
     max_lag = clamp(max_lag, 1, n ÷ 2 - 1)
-
-    # Score every lag in the window
     lags = collect(-max_lag:max_lag)
     vals = Vector{Float64}(undef, length(lags))
     @inbounds for (i, lag) in enumerate(lags)
         idx = lag >= 0 ? lag + 1 : n + lag + 1
         vals[i] = norm == 0 ? 0.0 : xc[idx] / norm
     end
+    return lags, vals
+end
 
-    # Greedy top-K with spacing constraint
+# Parabolic sub-sample peak: given the correlation values at the discrete peak
+# (`c`) and its two neighbours (`l`, `r`), return the offset (in samples, range
+# ±0.5) of the true peak from the discrete one. Same math as the visual
+# aligner's `_vs_parabolic`.
+function _parabolic_peak(l::Real, c::Real, r::Real)
+    d = l - 2c + r
+    return abs(d) < eps() ? 0.0 : clamp(0.5 * (l - r) / d, -1.0, 1.0)
+end
+
+"""
+    fft_xcorr_top_k(ref, query, max_lag; k=10, min_spacing=0) -> Vector{Tuple{Int,Float64}}
+
+Like `fft_xcorr_lag` but returns the K highest peaks within `|lag| ≤ max_lag`,
+enforcing a minimum lag spacing between selected peaks (so we don't grab a
+cluster of samples around the same peak). Sorted by correlation value
+descending. Used by `align_audio_rpm` to short-list candidates that can be
+disambiguated by session-level features.
+"""
+# Greedy top-K of a precomputed curve, enforcing a minimum lag spacing.
+function _top_k_from_curve(lags::AbstractVector{<:Integer}, vals::AbstractVector{<:Real};
+                           k::Int = 10, min_spacing::Int = 0)
     order = sortperm(vals; rev = true)
     selected = Tuple{Int,Float64}[]
     for j in order
@@ -183,6 +200,15 @@ function fft_xcorr_top_k(ref::AbstractVector{<:Real},
         end
     end
     return selected
+end
+
+function fft_xcorr_top_k(ref::AbstractVector{<:Real},
+                         query::AbstractVector{<:Real},
+                         max_lag::Int;
+                         k::Int = 10,
+                         min_spacing::Int = 0)
+    lags, vals = _fft_xcorr_curve(ref, query, max_lag)
+    return _top_k_from_curve(lags, vals; k = k, min_spacing = min_spacing)
 end
 
 """
@@ -280,6 +306,65 @@ function find_audio_active_start(video_path::AbstractString;
     return 0.0
 end
 
+# Partition 1:n into (up to) k contiguous, near-equal ranges. Shared by the
+# threaded STFT and visual frame loops.
+function _chunk_ranges(n::Int, k::Int)
+    k = max(1, min(k, n))
+    base = n ÷ k; rem = n % k
+    ranges = Vector{UnitRange{Int}}(undef, k)
+    start = 1
+    @inbounds for c in 1:k
+        len = base + (c <= rem ? 1 : 0)
+        ranges[c] = start:(start + len - 1)
+        start += len
+    end
+    return ranges
+end
+
+# Function barrier: the STFT hot loop over a frame range, with this thread's own
+# `buf`/`plan` (so nothing is shared) writing only its disjoint output slice.
+# Kept as a separately-typed function so the threaded body doesn't box.
+function _stft_rpm_kernel!(rpm_trace::Vector{Float64}, energy::Vector{Float64},
+                           audio, win::Vector{Float64}, krange::UnitRange{Int},
+                           hop::Int, window_size::Int, lo_bin::Int, hi_bin::Int,
+                           bin_hz::Float64, rpm_per_hz::Float64,
+                           buf::Vector{Float64}, plan, S::Vector{ComplexF64})
+    @inbounds for k in krange
+        s = (k - 1) * hop + 1
+        @simd for i in 1:window_size
+            buf[i] = Float64(audio[s + i - 1]) * win[i]
+        end
+        mul!(S, plan, buf)   # in-place rfft into the thread's own S (no per-frame alloc)
+
+        peak_bin = lo_bin
+        peak_mag = abs2(S[lo_bin])
+        e = 0.0
+        for b in lo_bin:hi_bin
+            m = abs2(S[b])
+            e += m
+            if m > peak_mag
+                peak_mag = m
+                peak_bin = b
+            end
+        end
+
+        # Parabolic interpolation around the peak for sub-bin precision
+        if peak_bin > lo_bin && peak_bin < hi_bin
+            y0 = log(abs2(S[peak_bin - 1]) + 1e-30)
+            y1 = log(peak_mag + 1e-30)
+            y2 = log(abs2(S[peak_bin + 1]) + 1e-30)
+            denom = (y0 - 2 * y1 + y2)
+            delta = abs(denom) < 1e-12 ? 0.0 : 0.5 * (y0 - y2) / denom
+            peak_freq = (peak_bin - 1 + clamp(delta, -1.0, 1.0)) * bin_hz
+        else
+            peak_freq = (peak_bin - 1) * bin_hz
+        end
+        rpm_trace[k] = peak_freq * rpm_per_hz
+        energy[k]    = e
+    end
+    return nothing
+end
+
 """
     audio_rpm_trace(audio, sr; window_size=2048, hop=200,
                     freq_band_hz=(300,800), cylinders=8) -> NamedTuple
@@ -313,44 +398,28 @@ function audio_rpm_trace(audio::AbstractVector{<:Real}, sr::Int;
 
     # Hann window
     win = [0.5 - 0.5 * cos(2π * (i - 1) / (window_size - 1)) for i in 1:window_size]
-    buf  = Vector{Float64}(undef, window_size)
-    plan = plan_rfft(buf)
 
     rpm_trace = Vector{Float64}(undef, n_frames)
     energy    = Vector{Float64}(undef, n_frames)
 
-    @inbounds for k in 1:n_frames
-        s = (k - 1) * hop + 1
-        for i in 1:window_size
-            buf[i] = Float64(audio[s + i - 1]) * win[i]
-        end
-        S = plan * buf
-
-        peak_bin = lo_bin
-        peak_mag = abs2(S[lo_bin])
-        e = 0.0
-        for b in lo_bin:hi_bin
-            m = abs2(S[b])
-            e += m
-            if m > peak_mag
-                peak_mag = m
-                peak_bin = b
-            end
-        end
-
-        # Parabolic interpolation around the peak for sub-bin precision
-        if peak_bin > lo_bin && peak_bin < hi_bin
-            y0 = log(abs2(S[peak_bin - 1]) + 1e-30)
-            y1 = log(peak_mag + 1e-30)
-            y2 = log(abs2(S[peak_bin + 1]) + 1e-30)
-            denom = (y0 - 2 * y1 + y2)
-            delta = abs(denom) < 1e-12 ? 0.0 : 0.5 * (y0 - y2) / denom
-            peak_freq = (peak_bin - 1 + clamp(delta, -1.0, 1.0)) * bin_hz
-        else
-            peak_freq = (peak_bin - 1) * bin_hz
-        end
-        rpm_trace[k] = peak_freq * rpm_per_hz
-        energy[k]    = e
+    # Threaded STFT: build one buf+plan per chunk SERIALLY (FFTW planning is not
+    # thread-safe), then run the chunks in parallel. Each chunk touches only its
+    # own buf/plan and writes a disjoint slice of the output — no shared state,
+    # no races. The hot loop lives in the _stft_rpm_kernel! function barrier.
+    # Leave ~2 cores free for GC / OS rather than saturating all threads.
+    nchunks = max(1, Threads.nthreads() - 2)
+    chunks  = _chunk_ranges(n_frames, nchunks)
+    nout    = window_size ÷ 2 + 1
+    # Preallocate per-chunk scratch ONCE and reuse across frames: input buf,
+    # FFTW plan, and the rfft output S. The kernel's mul! writes into S in place,
+    # so the hot loop allocates nothing.
+    bufs  = [Vector{Float64}(undef, window_size) for _ in eachindex(chunks)]
+    plans = [plan_rfft(bufs[c]) for c in eachindex(chunks)]
+    Ss    = [Vector{ComplexF64}(undef, nout) for _ in eachindex(chunks)]
+    Threads.@threads for c in eachindex(chunks)
+        _stft_rpm_kernel!(rpm_trace, energy, audio, win, chunks[c], hop, window_size,
+                          lo_bin, hi_bin, Float64(bin_hz), rpm_per_hz,
+                          bufs[c], plans[c], Ss[c])
     end
 
     return (rpm = rpm_trace, energy = energy, frame_hz = sr / hop)
@@ -408,8 +477,11 @@ function align_audio_rpm(video_path::AbstractString,
     # aliased copies of it will be in there too.
     max_lag     = round(Int, max_lag_s * frame_hz)
     min_spacing = round(Int, 30.0 * frame_hz)
-    peaks = fft_xcorr_top_k(tel_rpm, audio_rpm, max_lag;
-                            k = k_candidates, min_spacing = min_spacing)
+    # Compute the full correlation curve once: top-K candidates select from it,
+    # and the sub-sample refine (below) reads the chosen peak's neighbours.
+    xc_lags, xc_vals = _fft_xcorr_curve(tel_rpm, audio_rpm, max_lag)
+    peaks = _top_k_from_curve(xc_lags, xc_vals;
+                              k = k_candidates, min_spacing = min_spacing)
 
     # ─── Stage 2: session-level seed via boolean-signal xcorr ───
     # Convert both signals to a binary "is-racing" indicator (smoothed RPM
@@ -441,13 +513,26 @@ function align_audio_rpm(video_path::AbstractString,
 
     best_k = selected[1]
     conf   = selected[2]
-    offset_s = t0_tel - best_k / frame_hz
+
+    # ── sub-sample refine: parabolic fit to the chosen peak and its two
+    # neighbours (same step the visual aligner uses). This de-quantizes the
+    # 1/frame_hz grid. CAVEAT: the audio RPM trace is STFT-smoothed over
+    # ~window_size/audio_sr s and RPM is slow-moving, so the correlation peak is
+    # BROAD — the sub-frame shift is real but small, and not a license to trust
+    # millisecond precision the underlying signal can't support.
+    i = searchsortedfirst(xc_lags, best_k)
+    subshift = (1 < i < length(xc_lags) && xc_lags[i] == best_k) ?
+               _parabolic_peak(xc_vals[i-1], xc_vals[i], xc_vals[i+1]) : 0.0
+    coarse_offset_s = t0_tel - best_k / frame_hz
+    offset_s        = t0_tel - (best_k + subshift) / frame_hz
 
     return (
-        offset_s         = offset_s,
-        confidence       = conf,
-        lag_samples      = best_k,
-        frame_hz         = frame_hz,
+        offset_s          = offset_s,
+        confidence        = conf,
+        lag_samples       = best_k,
+        coarse_offset_s   = coarse_offset_s,
+        subsample_shift_s = offset_s - coarse_offset_s,
+        frame_hz          = frame_hz,
         active_frames    = count(>(e_thresh), a.energy),
         total_frames     = length(a.energy),
         session_offset_s = session_offset_s,

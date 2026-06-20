@@ -6,13 +6,13 @@ using Statistics
 const CHANNEL_BINDING = (
     time     = :Time,
     lap      = :lap,
-    speed    = :OTD_Conv_Speed,
+    speed    = :VectorGPS_Speed,
     rpm      = :EngineRotVel,
     gear     = :DriverGearNumber,
     throttle = :EngineThrottlePosition,
     brake    = :BrakePressFront,
     steering = :DriverSteeringAngle,
-    lap_frac = :OTD_Conv_LapFraction,
+    lap_frac = :VectorGPS_LapFrac,
     loop     = :loop_currently_on,
 )
 

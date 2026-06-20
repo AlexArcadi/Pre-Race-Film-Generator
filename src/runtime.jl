@@ -66,18 +66,47 @@ function detect_backend(; prefer::Symbol = :auto, force::Bool = false)
     return backend
 end
 
+# Well-known ffmpeg install locations to probe when it isn't on PATH: a manual
+# unzip under the user profile, the winget `Gyan.FFmpeg` link shim, C:\ffmpeg,
+# and chocolatey's shim dir.
+function _ffmpeg_fallback_dirs()
+    dirs = String[]
+    home = get(ENV, "USERPROFILE", get(ENV, "HOME", ""))
+    if !isempty(home)
+        push!(dirs, joinpath(home, "ffmpeg", "bin"))
+        push!(dirs, joinpath(home, "AppData", "Local", "Microsoft", "WinGet", "Links"))
+    end
+    push!(dirs, raw"C:\ffmpeg\bin")
+    push!(dirs, joinpath(get(ENV, "ProgramData", raw"C:\ProgramData"), "chocolatey", "bin"))
+    return dirs
+end
+
+"""
+    _which_ffmpeg() -> Union{String,Nothing}
+
+Locate a system ffmpeg. Asks the OS (`where`/`which`) first; if that finds
+nothing it returns `nothing` instead of throwing (a non-zero exit from `where`
+is "not found", not an error), then probes common install dirs so an ffmpeg
+that simply isn't on PATH is still picked up. `detect_backend` treats `nothing`
+as "fall back to the bundled FFMPEG_jll".
+"""
 function _which_ffmpeg()
-    candidates = if Sys.iswindows()
-        [readchomp(`where ffmpeg`) for _ in 1:1]
-    else
-        [readchomp(`which ffmpeg`) for _ in 1:1]
-    end
-    try
-        path = first(eachline(IOBuffer(candidates[1])))
-        return isempty(path) ? nothing : path
+    exe = Sys.iswindows() ? "ffmpeg.exe" : "ffmpeg"
+    # 1. On PATH? Swallow a non-zero exit (means "not found") instead of throwing.
+    onpath = try
+        raw = Sys.iswindows() ? readchomp(`where ffmpeg`) : readchomp(`which ffmpeg`)
+        p = first(eachline(IOBuffer(raw)))
+        isempty(p) ? nothing : p
     catch
-        return nothing
+        nothing
     end
+    onpath !== nothing && return onpath
+    # 2. Not on PATH — probe known install locations.
+    for d in _ffmpeg_fallback_dirs()
+        cand = joinpath(d, exe)
+        isfile(cand) && return cand
+    end
+    return nothing
 end
 
 function _probe_capabilities(exe::AbstractString)

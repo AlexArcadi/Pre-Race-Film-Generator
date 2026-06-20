@@ -280,6 +280,9 @@ function _resolve_alignment(spec, video_path, arrow_path, backend)
     elseif spec === :auto
         m = align_audio_rpm(video_path, arrow_path)
         return m.offset_s, merge((mode = :auto,), m)
+    elseif spec === :visual
+        m = align_visual_rotation(video_path, arrow_path; backend = backend)
+        return m.offset_s, merge((mode = :visual,), m)
     else
         error("Unknown audio_alignment: $spec")
     end

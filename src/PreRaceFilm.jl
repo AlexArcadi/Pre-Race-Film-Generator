@@ -9,6 +9,7 @@ include("datadir.jl")
 include("race.jl")
 include("track_map.jl")
 include("alignment.jl")
+include("visual_align.jl")
 include("render.jl")
 include("render_minimal.jl")
 include("pipeline.jl")
@@ -17,6 +18,8 @@ export detect_laps,
        load_telemetry,
        load_track_map,
        align_audio_rpm,
+       align_visual_rotation,
+       video_rotation_track,
        find_race_start,
        find_audio_active_start,
        generate_lap_video,
