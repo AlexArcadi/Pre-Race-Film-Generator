@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "d86ede91a8dcca26ad6fc78528e31710aa363fc9"
+project_hash = "a8efdc9c37aa5cf7e595bfc4e2c02d33749be644"
 
 [[deps.AbstractFFTs]]
 deps = ["LinearAlgebra"]
@@ -597,7 +597,7 @@ uuid = "2dfb63ee-cc39-5dd5-95bd-886bf059d720"
 version = "1.4.3"
 
 [[deps.PreRaceFilm]]
-deps = ["Arrow", "Cairo", "Colors", "DSP", "DataFrames", "FFMPEG_jll", "FFTW", "JSON3", "LinearAlgebra", "Printf", "Statistics", "TOML", "Tables"]
+deps = ["Arrow", "Cairo", "Colors", "DSP", "DataFrames", "FFMPEG_jll", "FFTW", "JSON3", "LinearAlgebra", "Printf", "Profile", "Statistics", "TOML", "Tables"]
 path = "."
 uuid = "5e1a2b6a-1f6e-4a4f-9c5e-8a1d3f9c0a01"
 version = "0.1.0"
@@ -756,6 +756,12 @@ git-tree-sha1 = "72df96b3a595b7aab1e101eb07d2a435963a97e2"
 uuid = "dc5dba14-91b3-4cab-a142-028a31da12f7"
 version = "1.5.0+2025b"
 
+[[deps.TableOperations]]
+deps = ["SentinelArrays", "Tables", "Test"]
+git-tree-sha1 = "e383c87cf2a1dc41fa30c093b2a19877c83e1bc1"
+uuid = "ab02a1b2-a7df-11e8-156e-fb1833f50b87"
+version = "1.2.0"
+
 [[deps.TableTraits]]
 deps = ["IteratorInterfaceExtensions"]
 git-tree-sha1 = "c06b2f539df1c6efa794486abfb6ed2022561a39"
@@ -772,6 +778,11 @@ version = "1.12.1"
 deps = ["ArgTools", "SHA"]
 uuid = "a4e569a6-e804-4fa4-b0f3-eef7a1d5b13e"
 version = "1.10.0"
+
+[[deps.Test]]
+deps = ["InteractiveUtils", "Logging", "Random", "Serialization"]
+uuid = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+version = "1.11.0"
 
 [[deps.TimeZones]]
 deps = ["Artifacts", "Dates", "Downloads", "InlineStrings", "Mocking", "Printf", "Scratch", "TZJData", "Unicode", "p7zip_jll"]

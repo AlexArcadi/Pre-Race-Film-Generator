@@ -27,10 +27,10 @@ function setup(; fw = 320, fh = 180)
     frame.data .= rand(fw, fh) .* 255.0          # synthetic gray frame
     frame.index = 5
     dummy = Channel{P.Frame}(1); pool = Channel{P.Frame}(1)
-    mkcfg(c) = P.StageConfig(c, P._hann(c.w, c.h), dummy, nothing, pool, [0.0], [0.0], 30.0, 0.0, 100)
+    mkcfg(c) = P.StageConfig(c, P._hann(c.w, c.h), dummy, nothing, pool, [[0.0]], [[0.0]], 30.0, 0.0, 100)
     rot = P.Crop(0.25, 0.50, 0.22, 0.28, fw, fh); cfg_rot = mkcfg(rot)
     fwd = P.Crop(0.18, 0.64, 0.30, 0.34, fw, fh); cfg_fwd = mkcfg(fwd)
-    srot = P.make_state(P.Yaw(), cfg_rot)
+    srot = P.make_state(P.Rotation(), cfg_rot)
     sfwd = P.make_state(P.Forward(), cfg_fwd)
     for _ in 1:3                                  # prime prev-frame state
         P.shift!(srot, cfg_rot, frame); P.forward_zoom!(sfwd, cfg_fwd, frame)
@@ -47,7 +47,7 @@ hot_crop(n)      = (for _ in 1:n; P.crop!(H.sfwd, H.cfg_fwd, H.frame); end; noth
 hot_magnitude(n) = (for _ in 1:n; P.magnitude!(H.sfwd); end; nothing)
 hot_logpolar(n)  = (for _ in 1:n; P.logpolar!(H.sfwd); end; nothing)
 hot_imgfft(n)    = (for _ in 1:n; mul!(H.sfwd.cur_freq, H.sfwd.img_plan, H.sfwd.cur); end; nothing)
-hot_lpradius(n)  = (for _ in 1:n; P.lp_radius!(H.sfwd); end; nothing)
+hot_lpshift(n)   = (for _ in 1:n; P.lp_shift!(H.sfwd); end; nothing)
 
 function tus(f, n = 5000)        # warm, GC, then time → µs per call
     f(2); GC.gc()
@@ -59,14 +59,14 @@ function summary()
     for (name, f) in (("forward zoom!", hot_forward), ("rotation shift!", hot_rotation),
                       ("  crop!", hot_crop), ("  image FFT", hot_imgfft),
                       ("  magnitude!", hot_magnitude), ("  logpolar!", hot_logpolar),
-                      ("  lp_radius!", hot_lpradius))
+                      ("  lp_shift!", hot_lpshift))
         println(rpad(name, 18), tus(f), " us")
     end
 end
 
 if isinteractive()
     println("\nReady — $(Threads.nthreads()) threads. Globals: H, hot_forward/rotation/crop/" *
-            "magnitude/logpolar/imgfft/lpradius(n), summary().")
+            "magnitude/logpolar/imgfft/lpshift(n), summary().")
 else
     summary()
 end

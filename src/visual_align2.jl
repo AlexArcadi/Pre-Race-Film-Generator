@@ -48,9 +48,8 @@ Frame(width::Int, height::Int) =
           Matrix{Float64}(undef, width, height))
 
 abstract type Stage end
-struct Yaw     <: Stage end
-struct Pitch   <: Stage end
-struct Forward <: Stage end
+struct Rotation <: Stage end   # yaw + pitch, both read off one phase-correlation surface
+struct Forward  <: Stage end
 
 # Crop window as resolved, inclusive pixel bounds in the frame's [x, y] grid. The
 # fractions → pixels conversion happens ONCE, in this constructor, when `align`
@@ -85,8 +84,8 @@ struct StageConfig
     in_ch::Channel{Frame}
     out_ch::Union{Channel{Frame}, Nothing}
     pool::Channel{Frame}
-    ref_t::Vector{Float64}        # telemetry timestamps for this stage's channel
-    ref_x::Vector{Float64}        # the channel itself (gyro yaw/pitch, or GPS speed)
+    ref_t::Vector{Vector{Float64}}   # telemetry time, one vector per channel this stage votes on
+    ref_x::Vector{Vector{Float64}}   # matching telemetry values (gyro yaw/pitch, GPS speed, …)
     fps::Float64
     start_s::Float64              # decode start, so series times are absolute video time
     capacity::Int                 # expected frame count; the worker preallocates series to it
@@ -120,12 +119,12 @@ function crop!(state::State, config::StageConfig, frame::Frame)
     return cur
 end
 
-# Append one measurement to the preallocated series.
-function record!(state::State, config::StageConfig, value::Float64, frame::Frame)
+# Bump the sample count and stamp the (absolute video) time; return the new index.
+# Each stage then writes its named series at that index.
+function advance!(state::State, config::StageConfig, frame::Frame)
     state.n += 1
-    state.series[state.n] = value
     state.times[state.n] = config.start_s + frame.index / config.fps
-    return nothing
+    return state.n
 end
 
 # ── interface (stubs — fill once inputs are settled) ─────────────────────────
@@ -179,17 +178,8 @@ function run_decoder(out_ch::Channel{Frame}, pool::Channel{Frame}, video_path::A
     close(out_ch)
 end
 
-# Load a telemetry channel (Time + `channel`), dropping pre-green / NaN samples.
-function _load_channel(arrow_path::AbstractString, channel::Symbol)
-    tbl = Arrow.Table(arrow_path)
-    t = Float64.(collect(Tables.getcolumn(tbl, :Time)))
-    x = Float64.(collect(Tables.getcolumn(tbl, channel)))
-    keep = isfinite.(t) .& isfinite.(x)
-    return t[keep], x[keep]
-end
-
-# Build the pool + daisy-chained channels (decoder → Yaw → Pitch → Forward → pool),
-# spawn the decoder and one worker per stage, and gather each stage's AlignEstimate.
+# Build the pool + daisy-chained channels (decoder → Rotation → Forward → pool),
+# spawn the decoder and one worker per stage, and gather every channel's estimate.
 # States are built here (serially) before spawning — FFTW planning isn't thread-safe.
 function align(video_path::AbstractString, arrow_path::AbstractString;
                start_s::Real = 300.0, dur_s::Real = 900.0, fps::Real = 30.0,
@@ -197,41 +187,48 @@ function align(video_path::AbstractString, arrow_path::AbstractString;
                rotation_crop = (0.25, 0.50, 0.22, 0.28),
                forward_crop  = (0.18, 0.64, 0.30, 0.34),
                backend::FfmpegBackend = detect_backend())
-    yaw_t,   yaw_x   = _load_channel(arrow_path, :ChassisRotVelYawIDR)
-    pitch_t, pitch_x = _load_channel(arrow_path, :ChassisRotVelPitchIDR)
-    speed_t, speed_x = _load_channel(arrow_path, :VectorGPS_Speed)
+    # one read; bulk-collect each column to Float64, then drop rows where any is non-finite.
+    tbl   = Arrow.Table(arrow_path)
+    time  = Float64.(tbl.Time)
+    yaw   = Float64.(tbl.ChassisRotVelYawIDR)
+    pitch = Float64.(tbl.ChassisRotVelPitchIDR)
+    speed = Float64.(tbl.VectorGPS_Speed)
+    roll  = Float64.(tbl.ChassisRotVelRollIDR)
+    keep  = isfinite.(yaw) .& isfinite.(pitch) .& isfinite.(speed) .& isfinite.(roll)
+    time = time[keep]; yaw = yaw[keep]; pitch = pitch[keep]; speed = speed[keep]; roll = roll[keep]
 
-    capacity = ceil(Int, Float64(dur_s) * fps) + 16
-    rot = Crop(Float64.(rotation_crop)..., frame_w, frame_h)
-    fwd = Crop(Float64.(forward_crop)...,  frame_w, frame_h)
-    rot_window = _hann(rot.w, rot.h)
-    fwd_window = _hann(fwd.w, fwd.h)
+    # ffmpeg returns a bit more than dur·fps (its -ss seeks to a keyframe just before
+    # start_s, decoding some pre-roll); over-allocate so the workers never overflow.
+    slack_s = max(2.0, 0.01 * Float64(dur_s))
+    capacity = ceil(Int, (Float64(dur_s) + slack_s) * fps) + 16
+    rot = Crop(rotation_crop..., frame_w, frame_h)
+    fwd = Crop(forward_crop...,  frame_w, frame_h)
 
     pool = Channel{Frame}(10)
     for _ in 1:10
         put!(pool, Frame(frame_w, frame_h))
     end
-    ch_yaw   = Channel{Frame}(4)
-    ch_pitch = Channel{Frame}(4)
-    ch_fwd   = Channel{Frame}(4)
+    ch_rot = Channel{Frame}(4)
+    ch_fwd = Channel{Frame}(4)
 
-    cfg_yaw   = StageConfig(rot, rot_window, ch_yaw,   ch_pitch, pool, yaw_t,   yaw_x,   Float64(fps), Float64(start_s), capacity)
-    cfg_pitch = StageConfig(rot, rot_window, ch_pitch, ch_fwd,   pool, pitch_t, pitch_x, Float64(fps), Float64(start_s), capacity)
-    cfg_fwd   = StageConfig(fwd, fwd_window, ch_fwd,   nothing,  pool, speed_t, speed_x, Float64(fps), Float64(start_s), capacity)
+    cfg_rot = StageConfig(rot, _hann(rot.w, rot.h), ch_rot, ch_fwd,  pool,
+                          [time, time], [yaw, pitch], Float64(fps), Float64(start_s), capacity)
+    cfg_fwd = StageConfig(fwd, _hann(fwd.w, fwd.h), ch_fwd, nothing, pool,
+                          [time, time], [speed, roll], Float64(fps), Float64(start_s), capacity)
 
     # build states serially (FFTW planning), then run each stage on its own task
-    state_yaw   = make_state(Yaw(),     cfg_yaw)
-    state_pitch = make_state(Pitch(),   cfg_pitch)
-    state_fwd   = make_state(Forward(), cfg_fwd)
+    state_rot = make_state(Rotation(), cfg_rot)
+    state_fwd = make_state(Forward(),  cfg_fwd)
 
     vf = "scale=$(frame_w):$(frame_h),format=gray"
-    decoder = Threads.@spawn run_decoder(ch_yaw, pool, video_path, vf, start_s, dur_s, fps, backend)
-    w_yaw   = Threads.@spawn run_worker(Yaw(),     state_yaw,   cfg_yaw)
-    w_pitch = Threads.@spawn run_worker(Pitch(),   state_pitch, cfg_pitch)
-    w_fwd   = Threads.@spawn run_worker(Forward(), state_fwd,   cfg_fwd)
+    decoder = Threads.@spawn run_decoder(ch_rot, pool, video_path, vf, start_s, dur_s, fps, backend)
+    w_rot = Threads.@spawn run_worker(Rotation(), state_rot, cfg_rot)
+    w_fwd = Threads.@spawn run_worker(Forward(),  state_fwd, cfg_fwd)
 
     wait(decoder)
-    return (yaw = fetch(w_yaw), pitch = fetch(w_pitch), forward = fetch(w_fwd))
+    rot_ests = fetch(w_rot)      # [yaw, pitch]
+    fwd_ests = fetch(w_fwd)      # [forward, roll]
+    return (yaw = rot_ests[1], pitch = rot_ests[2], forward = fwd_ests[1], roll = fwd_ests[2])
 end
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -247,25 +244,31 @@ function _hann(cw::Int, ch::Int)
 end
 
 mutable struct RotationState{P, IP} <: State
-    cur::Matrix{ComplexF64}       # windowed crop (complex), filled by crop!
-    cur_freq::Matrix{ComplexF64}
+    cur::Matrix{Float64}          # windowed crop (REAL → rfft), filled by crop!
+    cur_freq::Matrix{ComplexF64}  # rfft half-spectrum (cw÷2+1) × ch
     prev_freq::Matrix{ComplexF64}
     cross::Matrix{ComplexF64}
-    corr::Matrix{ComplexF64}
+    corr::Matrix{Float64}         # real correlation surface (brfft output)
     plan::P
     iplan::IP
     have_prev::Bool
-    series::Vector{Float64}
+    yaw::Vector{Float64}          # horizontal-shift series, one sample per frame
+    pitch::Vector{Float64}        # vertical-shift series
     times::Vector{Float64}
     n::Int
 end
 
-function make_state(::Union{Yaw, Pitch}, config::StageConfig)
+function make_state(::Rotation, config::StageConfig)
     cw = config.crop.w; ch = config.crop.h
-    cur = Matrix{ComplexF64}(undef, cw, ch); cross = similar(cur)
-    return RotationState(cur, similar(cur), similar(cur), cross, similar(cur),
-        plan_fft(cur), plan_bfft(cross), false,
-        Vector{Float64}(undef, config.capacity), Vector{Float64}(undef, config.capacity), 0)
+    cur = Matrix{Float64}(undef, cw, ch)
+    cur_freq = Matrix{ComplexF64}(undef, cw ÷ 2 + 1, ch); cross = similar(cur_freq)
+    corr = Matrix{Float64}(undef, cw, ch)
+    cap = config.capacity
+    return RotationState(cur, cur_freq, similar(cur_freq), cross, corr,
+        plan_rfft(cur), plan_brfft(cross, cw), false,
+        Vector{Float64}(undef, cap),    # yaw
+        Vector{Float64}(undef, cap),    # pitch
+        Vector{Float64}(undef, cap), 0) # times, n
 end
 
 # (dx, dy) sub-pixel shift between this crop and the previous; (NaN, NaN) priming.
@@ -287,16 +290,16 @@ function shift!(state::RotationState, config::StageConfig, frame::Frame)
     return peak_shift(state.corr)
 end
 
-# Sub-pixel peak of a phase-correlation surface → (dx, dy), wraparound handled.
+# Sub-pixel peak of a (real) phase-correlation surface → (dx, dy), wraparound handled.
 function peak_shift(corr)
     nx, ny = size(corr); bx = 1; by = 1; best = -Inf
     @inbounds for y in 1:ny, x in 1:nx
-        v = real(corr[x, y])
+        v = corr[x, y]
         if v > best; best = v; bx = x; by = y; end
     end
-    peak = real(corr[bx, by])
-    dx = (bx - 1) + _parabolic_peak(real(corr[mod1(bx - 1, nx), by]), peak, real(corr[mod1(bx + 1, nx), by]))
-    dy = (by - 1) + _parabolic_peak(real(corr[bx, mod1(by - 1, ny)]), peak, real(corr[bx, mod1(by + 1, ny)]))
+    peak = corr[bx, by]
+    dx = (bx - 1) + _parabolic_peak(corr[mod1(bx - 1, nx), by], peak, corr[mod1(bx + 1, nx), by])
+    dy = (by - 1) + _parabolic_peak(corr[bx, mod1(by - 1, ny)], peak, corr[bx, mod1(by + 1, ny)])
     dx = dx >= nx / 2 ? dx - nx : dx
     dy = dy >= ny / 2 ? dy - ny : dy
     return (dx, dy)
@@ -308,121 +311,126 @@ end
 # zoom rate ∝ speed. Translation-invariant, so cornering doesn't contaminate it.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Signed, sub-bin radial (log-scale) shift of a phase-correlation surface.
-function radial_peak(corr)
+# Sub-bin (angular, radial) shift of the log-polar phase-correlation peak.
+# angular ⇒ roll, radial ⇒ zoom (∝ speed). Signed, wraparound on both axes.
+function logpolar_peak(corr)
     n_angle, n_radius = size(corr)
     best = -Inf; pa = 1; pr = 1
     @inbounds for b in 1:n_radius, a in 1:n_angle
-        v = real(corr[a, b])
+        v = corr[a, b]
         if v > best; best = v; pa = a; pr = b; end
     end
-    left  = real(corr[pa, mod1(pr - 1, n_radius)])
-    middle = real(corr[pa, pr])
-    right = real(corr[pa, mod1(pr + 1, n_radius)])
-    curvature = left - 2middle + right
-    sub_bin = abs(curvature) < eps() ? 0.0 : clamp(0.5 * (left - right) / curvature, -1.0, 1.0)
-    shift = (pr - 1) + sub_bin
-    return shift > n_radius / 2 ? shift - n_radius : shift
+    peak = corr[pa, pr]
+    angular = (pa - 1) + _parabolic_peak(corr[mod1(pa - 1, n_angle), pr], peak, corr[mod1(pa + 1, n_angle), pr])
+    radial  = (pr - 1) + _parabolic_peak(corr[pa, mod1(pr - 1, n_radius)], peak, corr[pa, mod1(pr + 1, n_radius)])
+    angular = angular > n_angle  / 2 ? angular - n_angle  : angular
+    radial  = radial  > n_radius / 2 ? radial  - n_radius : radial
+    return angular, radial
 end
 
 mutable struct ForwardState{P, LP, LIP} <: State
-    cur::Matrix{ComplexF64}          # windowed crop (complex), filled by crop!
-    cur_freq::Matrix{ComplexF64}
-    mag::Matrix{Float64}             # centred, high-passed magnitude
-    highpass::Matrix{Float64}        # FM tables (immutable, crop-specific)
-    shx::Vector{Int}
-    shy::Vector{Int}
+    cur::Matrix{Float64}             # windowed crop (REAL now → rfft), filled by crop!
+    cur_freq::Matrix{ComplexF64}     # rfft half-spectrum: (cw÷2+1) × ch
+    mag::Matrix{Float64}             # high-passed |half-spectrum|, y-fftshifted
+    highpass::Matrix{Float64}        # FM high-pass over the half-spectrum
+    shy::Vector{Int}                 # y-fftshift only (rfft puts DC at row 1 in x → no shx)
     sample_x::Matrix{Float64}
     sample_y::Matrix{Float64}
-    lp::Matrix{ComplexF64}           # this frame's log-polar magnitude (complex, DC-removed)
-    lp_freq::Matrix{ComplexF64}      # its FFT
-    lp_prev_freq::Matrix{ComplexF64} # last frame's FFT, carried over — no recompute
+    lp::Matrix{Float64}              # this frame's log-polar magnitude (REAL → rfft)
+    lp_freq::Matrix{ComplexF64}      # its rfft half-spectrum (n_angle÷2+1) × n_radius
+    lp_prev_freq::Matrix{ComplexF64} # last frame's, carried over — no recompute
     lp_cross::Matrix{ComplexF64}
-    lp_corr::Matrix{ComplexF64}
+    lp_corr::Matrix{Float64}         # real correlation surface (brfft output)
     img_plan::P
     lp_plan::LP
     lp_iplan::LIP
     n_angle::Int
     n_radius::Int
     have_prev::Bool
-    series::Vector{Float64}
+    zoom::Vector{Float64}        # radial-shift series (∝ speed)
+    roll::Vector{Float64}        # angular-shift series (∝ roll rate)
     times::Vector{Float64}
     n::Int
 end
 
 function make_state(::Forward, config::StageConfig; n_angle::Int = 128, n_radius::Int = 64)
     cw = config.crop.w; ch = config.crop.h
-    # FM tables for this crop, built once:
-    highpass = Matrix{Float64}(undef, cw, ch)                   # Reddy–Chatterji high-pass
-    @inbounds for j in 1:ch, i in 1:cw
-        fx = (i - (cw + 1) / 2) / cw; fy = (j - (ch + 1) / 2) / ch
+    rw = cw ÷ 2 + 1                                             # rfft half-spectrum rows (fx ≥ 0)
+    half_y = ch ÷ 2
+    # Reddy–Chatterji high-pass over the half-spectrum: fx = (row-1)≥0, fy centred at col half_y+1.
+    highpass = Matrix{Float64}(undef, rw, ch)
+    @inbounds for j in 1:ch, i in 1:rw
+        fx = (i - 1) / cw                                       # 0 .. 0.5
+        fy = (j - (half_y + 1)) / ch                            # -0.5 .. ~0.5
         cosine = cos(π * fx) * cos(π * fy)
         highpass[i, j] = (1 - cosine) * (2 - cosine)
     end
-    #TODO: you can store .5cw, not sure the compiler would do that or not
-    shx = [((i - 1 + cw ÷ 2) % cw) + 1 for i in 1:cw]           # per-axis fftshift maps
-    shy = [((j - 1 + ch ÷ 2) % ch) + 1 for j in 1:ch]
-    cx = (cw + 1) / 2; cy = (ch + 1) / 2                        # log-polar grid on DC, clamped
-    log_radii = range(log(3.0), log(min(cw, ch) / 2 - 1.0); length = n_radius)
+    shy = [((j - 1 + half_y) % ch) + 1 for j in 1:ch]          # y-fftshift only (DC already at row 1)
+    # log-polar grid on DC = (row 1, col half_y+1), sampling the fx ≥ 0 half-plane
+    # (angles -π/2 .. π/2) — the magnitude spectrum is point-symmetric, so half covers it.
+    cx = 1.0; cy = half_y + 1.0
+    rmax = min(cw ÷ 2, half_y) - 1.0
+    log_radii = range(log(3.0), log(rmax); length = n_radius)
     sample_x = Matrix{Float64}(undef, n_angle, n_radius); sample_y = similar(sample_x)
     @inbounds for a in 1:n_angle
-        angle = π * (a - 1) / n_angle; cos_a = cos(angle); sin_a = sin(angle)
+        angle = -π / 2 + π * (a - 1) / n_angle; cos_a = cos(angle); sin_a = sin(angle)
         for b in 1:n_radius
             radius = exp(log_radii[b])
-            sample_x[a, b] = clamp(cx + radius * cos_a, 1.0, cw - 1e-3)
+            sample_x[a, b] = clamp(cx + radius * cos_a, 1.0, rw - 1e-3)
             sample_y[a, b] = clamp(cy + radius * sin_a, 1.0, ch - 1e-3)
         end
     end
-    cur = Matrix{ComplexF64}(undef, cw, ch)
-    lp = Matrix{ComplexF64}(undef, n_angle, n_radius); lp_cross = similar(lp)
+    cur = Matrix{Float64}(undef, cw, ch)
+    cur_freq = Matrix{ComplexF64}(undef, rw, ch)
+    lp = Matrix{Float64}(undef, n_angle, n_radius)
+    lp_freq = Matrix{ComplexF64}(undef, n_angle ÷ 2 + 1, n_radius); lp_cross = similar(lp_freq)
+    lp_corr = Matrix{Float64}(undef, n_angle, n_radius)
     return ForwardState(
-        cur, similar(cur), Matrix{Float64}(undef, cw, ch), highpass, shx, shy, sample_x, sample_y,
-        lp, similar(lp), similar(lp), lp_cross, similar(lp),
-        plan_fft(cur), plan_fft(lp), plan_bfft(lp_cross), n_angle, n_radius, false,
-        Vector{Float64}(undef, config.capacity), Vector{Float64}(undef, config.capacity), 0)
+        cur, cur_freq, Matrix{Float64}(undef, rw, ch), highpass, shy, sample_x, sample_y,
+        lp, lp_freq, similar(lp_freq), lp_cross, lp_corr,
+        plan_rfft(cur), plan_rfft(lp), plan_brfft(lp_cross, n_angle), n_angle, n_radius, false,
+        Vector{Float64}(undef, config.capacity),    # zoom
+        Vector{Float64}(undef, config.capacity),    # roll
+        Vector{Float64}(undef, config.capacity), 0) # times, n
 end
 
-# The FM pass, as steps: window the crop → image FFT → centred magnitude →
-# log-polar → phase-correlate vs the previous → radial (zoom) shift. NaN priming.
+# The FM pass: window the crop → image FFT → centred magnitude → log-polar →
+# phase-correlate vs the previous → (zoom, roll). (NaN, NaN) while priming.
 function forward_zoom!(state::ForwardState, config::StageConfig, frame::Frame)
     crop!(state, config, frame)
     mul!(state.cur_freq, state.img_plan, state.cur)
     magnitude!(state)
-    logpolar!(state)                                # → state.lp (complex)
+    logpolar!(state)                                # → state.lp (real)
     mul!(state.lp_freq, state.lp_plan, state.lp)    # the only log-polar FFT this frame
     @inbounds state.lp_freq[1, 1] = 0               # DC removal ≡ demean pre-FFT (no window → exact)
     if !state.have_prev
         state.lp_prev_freq, state.lp_freq = state.lp_freq, state.lp_prev_freq
         state.have_prev = true
-        return NaN
+        return (NaN, NaN)
     end
-    zoom = lp_radius!(state)
+    roll, zoom = lp_shift!(state)
     state.lp_prev_freq, state.lp_freq = state.lp_freq, state.lp_prev_freq   # carry forward
-    return zoom
+    return (zoom, roll)
 end
 
-# cur_freq → centred, high-passed magnitude. The x-fftshift is a block swap, so
-# each column is two contiguous runs — kept separate so the abs·highpass goes wide
-# (sqrt∘abs2 vectorizes; complex `abs`/hypot does not). Locals hoisted off `state`.
+# rfft half-spectrum → high-passed |spectrum|, y-fftshifted. DC sits at row 1 (fx≥0)
+# so there's no x-shift — each column is one contiguous run, abs·highpass goes wide (sqrt∘abs2 vectorizes
 function magnitude!(state::ForwardState)
     cur_freq = state.cur_freq; mag = state.mag; hp = state.highpass; shy = state.shy
-    cw, ch = size(mag); half = cw ÷ 2; rest = cw - half
+    rw, ch = size(mag)
     @fastmath @inbounds for j in 1:ch
-        col = shy[j]                                   # column fftshift: one lookup per column
-        @simd for i in 1:rest
-            mag[i, j] = sqrt(abs2(cur_freq[half + i, col])) * hp[i, j]
-        end
-        @simd for i in 1:half
-            mag[rest + i, j] = sqrt(abs2(cur_freq[i, col])) * hp[rest + i, j]
+        col = shy[j]                                   # y-fftshift; x needs none (DC at row 1)
+        @simd for i in 1:rw                            # contiguous column read of the half-spectrum
+            mag[i, j] = sqrt(abs2(cur_freq[i, col])) * hp[i, j]
         end
     end
     return mag
 end
 
-# mag → state.lp: bilinear log-polar sample (separable muladd lerp → FMAs),
-# written complex (imag 0). DC is NOT removed here — it's killed by zeroing the
-# DC bin after the FFT (forward_zoom!), which is exactly equivalent (no window on
-# the log-polar, so no leakage) and saves the sum + demean passes over `lp`.
+# mag → state.lp: bilinear log-polar sample (separable muladd lerp → FMAs), real.
+# DC is NOT removed here — it's killed by zeroing the DC bin after the FFT
+# (forward_zoom!), exactly equivalent (no window on the log-polar, so no leakage)
+# and saves the sum + demean passes over `lp`.
 function logpolar!(state::ForwardState)
     mag = state.mag; out = state.lp; sx = state.sample_x; sy = state.sample_y
     @inbounds for b in 1:state.n_radius, a in 1:state.n_angle
@@ -437,35 +445,36 @@ function logpolar!(state::ForwardState)
     return out
 end
 
-# Phase-correlate the carried previous log-polar FFT vs this frame's → radial shift.
-# Cross-power + phase-normalize fused into ONE pass — no broadcast materialize, no
-# second sweep of lp_cross (sqrt∘abs2, not hypot).
-function lp_radius!(state::ForwardState)
+# Phase-correlate the carried previous log-polar FFT vs this frame's → (angular, radial)
+# = (roll, zoom). Cross-power + phase-normalize fused into ONE pass (sqrt∘abs2, not hypot).
+function lp_shift!(state::ForwardState)
     cross = state.lp_cross; prev = state.lp_prev_freq; cur = state.lp_freq
     @fastmath @inbounds @simd for i in eachindex(cross)
         z = prev[i] * conj(cur[i])
         cross[i] = z / (sqrt(abs2(z)) + eps())
     end
     mul!(state.lp_corr, state.lp_iplan, cross)
-    return radial_peak(state.lp_corr)
+    return logpolar_peak(state.lp_corr)
 end
 
 # ── consume! — fold one frame into a stage's series (all stages, together) ────
-function consume!(::Yaw, state::RotationState, config::StageConfig, frame::Frame)
-    dx, _ = shift!(state, config, frame)
-    isnan(dx) || record!(state, config, dx, frame)
-    return nothing
-end
-
-function consume!(::Pitch, state::RotationState, config::StageConfig, frame::Frame)
-    _, dy = shift!(state, config, frame)
-    isnan(dy) || record!(state, config, dy, frame)
+function consume!(::Rotation, state::RotationState, config::StageConfig, frame::Frame)
+    dx, dy = shift!(state, config, frame)
+    if !isnan(dx)
+        i = advance!(state, config, frame)
+        state.yaw[i] = dx
+        state.pitch[i] = dy
+    end
     return nothing
 end
 
 function consume!(::Forward, state::ForwardState, config::StageConfig, frame::Frame)
-    zoom = forward_zoom!(state, config, frame)
-    isnan(zoom) || record!(state, config, zoom, frame)
+    zoom, roll = forward_zoom!(state, config, frame)
+    if !isnan(zoom)
+        i = advance!(state, config, frame)
+        state.zoom[i] = zoom
+        state.roll[i] = roll
+    end
     return nothing
 end
 
@@ -539,9 +548,9 @@ end
 # Slide the (conditioned, z-normed) series against the conditioned reference and
 # return (offset_s, confidence). `condition` band-passes or smooths each signal;
 # `signed` keeps the max peak (speed) vs the |peak| (rotation, sign/scale-free).
-function _crosscorr(state::State, ref_t, ref_x, fs::Float64, condition, signed::Bool)
+function _crosscorr(state::State, series, ref_t, ref_x, fs::Float64, condition, signed::Bool)
     vtimes = view(state.times, 1:state.n)
-    _, template = _resample(vtimes, view(state.series, 1:state.n), fs)
+    _, template = _resample(vtimes, view(series, 1:state.n), fs)
     ref_t0, ref = _resample(ref_t, ref_x, fs)
     template = _znorm(condition(template, fs))
     ref = condition(ref, fs)
@@ -559,16 +568,22 @@ function _crosscorr(state::State, ref_t, ref_x, fs::Float64, condition, signed::
     return offset, score[k]
 end
 
-# Rotation (Yaw/Pitch): band-pass, sign-invariant peak.
-function correlate(stage::Union{Yaw, Pitch}, state::RotationState, config::StageConfig)
-    offset, conf = _crosscorr(state, config.ref_t, config.ref_x, 30.0,
-                              (x, fs) -> _bandpass(x, fs), false)
-    return AlignEstimate(offset, conf, stage isa Yaw ? :yaw : :pitch, (n_frames = state.n,))
+# Rotation: yaw and pitch series, each band-passed against its gyro (sign-invariant peak).
+function correlate(::Rotation, state::RotationState, config::StageConfig)
+    bp = (x, fs) -> _bandpass(x, fs)
+    yo, yc = _crosscorr(state, state.yaw,   config.ref_t[1], config.ref_x[1], 30.0, bp, false)
+    po, pc = _crosscorr(state, state.pitch, config.ref_t[2], config.ref_x[2], 30.0, bp, false)
+    return [AlignEstimate(yo, yc, :yaw,   (n_frames = state.n,)),
+            AlignEstimate(po, pc, :pitch, (n_frames = state.n,))]
 end
 
-# Forward: smooth, signed peak.
+# Forward: smooth the zoom proxy vs GPS speed (signed peak); band-pass the roll proxy
+# vs the roll gyro (sign-invariant), same as the yaw/pitch axes.
 function correlate(::Forward, state::ForwardState, config::StageConfig)
-    offset, conf = _crosscorr(state, config.ref_t, config.ref_x, 5.0,
-                              (x, fs) -> _smooth(x, max(1, round(Int, 3.0 * fs))), true)
-    return AlignEstimate(offset, conf, :forward, (n_frames = state.n,))
+    fo, fc = _crosscorr(state, state.zoom, config.ref_t[1], config.ref_x[1], 5.0,
+                        (x, fs) -> _smooth(x, max(1, round(Int, 3.0 * fs))), true)
+    ro, rc = _crosscorr(state, state.roll, config.ref_t[2], config.ref_x[2], 30.0,
+                        (x, fs) -> _bandpass(x, fs), false)
+    return [AlignEstimate(fo, fc, :forward, (n_frames = state.n,)),
+            AlignEstimate(ro, rc, :roll,    (n_frames = state.n,))]
 end
