@@ -337,7 +337,6 @@ function align_audio_rpm(video_path::AbstractString,
                          window_size::Int = 2048,
                          hop::Int = 200,
                          cylinders::Int = 8,
-                         max_lag_s::Real = 1800.0,
                          energy_pctile::Real = 0.4,
                          k_candidates::Int = 12,
                          disambiguation_tol_s::Real = 60.0)
@@ -361,7 +360,10 @@ function align_audio_rpm(video_path::AbstractString,
     # Top-K peaks, spaced ≥ 30 s apart so we don't grab a cluster of samples
     # around the same lobe. The TRUE peak should be in this list; lap-period
     # aliased copies of it will be in there too.
-    max_lag     = round(Int, max_lag_s * frame_hz)
+    # max_lag = N - 1 uses the full headroom _fft_xcorr_curve clamps to
+    # (n÷2 - 1, with n = nextpow(2, 2N)). Any seconds-cap is arbitrary and
+    # silently rails on long offsets (e.g. Sonoma's ~−2330 s).
+    max_lag     = min(length(tel_rpm), length(audio_rpm)) - 1
     min_spacing = round(Int, 30.0 * frame_hz)
     # Compute the full correlation curve once: top-K candidates select from it,
     # and the sub-sample refine (below) reads the chosen peak's neighbours.
