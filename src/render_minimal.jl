@@ -6,8 +6,8 @@
 # can carve out a right-side stat column showing boxed MPH / RPM / GEAR
 # values, without disturbing the :full template.
 #
-# Select via `template = :minimal` on generate_lap_video / render_lap /
-# process. The full 6-channel layout remains the default.
+# Select via `template = :minimal` on generate_lap_video / process. The full
+# 6-channel layout remains the default.
 
 const CH_ORDER_MINIMAL = (:THROTTLE, :BRAKE, :STEERING)
 const STAT_ORDER_MINIMAL = (:MPH, :RPM, :GEAR)
@@ -31,7 +31,7 @@ function _find_car_number_file(num::Integer)
 end
 
 """
-    load_car_number_graphic(num, height, backend) -> Union{Nothing, CairoSurface}
+    load_car_number_graphic(num, height) -> Union{Nothing, CairoSurface}
 
 Decode `NCS Car Number Graphics/<num>/<file>` via ffmpeg at the requested
 height (width auto from aspect ratio), then flood-fill near-white pixels
@@ -40,20 +40,17 @@ own fill) is preserved because the flood fill seeds only on the edges.
 Returns nothing if the folder or file is missing. Cached by (num, height).
 """
 function load_car_number_graphic(num::Integer,
-                                 height::Int = CAR_NUMBER_GRAPHIC_H,
-                                 backend = detect_backend())
+                                 height::Int = CAR_NUMBER_GRAPHIC_H)
     key = (Int(num), height)
     haskey(_CAR_NUMBER_CACHE, key) && return _CAR_NUMBER_CACHE[key]
     path = _find_car_number_file(num)
     path === nothing && return nothing
 
-    bytes = with_backend(backend) do exe
-        args = String[exe, "-hide_banner", "-loglevel", "error",
-                      "-i", String(path),
-                      "-vf", "scale=-2:$height",
-                      "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"]
-        read(Cmd(args))
-    end
+    args = String[ffmpeg_exe(), "-hide_banner", "-loglevel", "error",
+                  "-i", String(path),
+                  "-vf", "scale=-2:$height",
+                  "-f", "rawvideo", "-pix_fmt", "bgra", "pipe:1"]
+    bytes = read(Cmd(args))
     isempty(bytes) && return nothing
     px_total = length(bytes) ÷ 4
     W = px_total ÷ height

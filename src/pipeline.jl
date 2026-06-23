@@ -3,52 +3,62 @@ using DataFrames
 using Printf
 
 """
-    generate_lap_video(video_path, arrow_path, lap_number;
-                       output_path,
-                       track            = nothing,
-                       track_map_db     = default_db_path(),
-                       driver_label     = "",
-                       event_label      = "",
-                       fps              = 25,
-                       resolution       = (1280, 720),
-                       audio_alignment  = :auto,
-                       ranges           = default_ranges(),
-                       progress         = nothing) -> NamedTuple
+    generate_lap_video(cfg::RaceConfig, car::Integer, lap::Integer;
+                       fps=25, resolution=(1280,720), template=:full,
+                       track=:auto, track_map_db=default_db_path(),
+                       ranges=default_ranges(), audio_alignment=nothing,
+                       fine_tune_s=nothing, overwrite=false, progress=nothing)
+        -> NamedTuple
 
-Top-level entry point. Detects the requested lap in the arrow file, aligns
-the video to telemetry via audio↔RPM cross-correlation (unless overridden),
-trims the source clip, renders overlay frames with Cairo, and pipes
-everything through a single ffmpeg invocation to produce `output_path`.
+The entry point. Resolves the session files, driver/event labels, per-car
+overrides, and output path from `cfg`, then detects the lap, aligns the video
+to telemetry via audio↔RPM cross-correlation (unless `audio_alignment` gives a
+precomputed offset — e.g. from `process`), trims the source clip, renders Cairo
+overlay frames, and pipes everything through a single ffmpeg invocation.
 
-RUNNING SCRIPT:
-- Play pipeline.jl
-- paste into REPL: using Pkg; Pkg.activate(".")
-- paste into REPL: using PreRaceFilm
-- Play render_minimal.jl or render_full.jl to generate videos with different overlay templates.
-- paste into REPL: const CFG = getConfig()
-- paste into REPL: process(CFG; cars = [9], laps = [70], template = :minimal)
+Returns `(; output_path, skipped=true)` without rendering if the output already
+exists and `overwrite=false`.
 
+    cfg = getConfig("25POC1")            # or getConfig() for [current].race
+    generate_lap_video(cfg, 9, 119; template = :minimal)
+    process(cfg; cars = [9], laps = :all)   # batch
 """
-function generate_lap_video(video_path::AbstractString,
-                            arrow_path::AbstractString,
-                            lap_number::Integer;
-                            output_path::AbstractString,
-                            track::Union{Nothing,Symbol,AbstractString} = :auto,
-                            track_map_db::AbstractString = default_db_path(),
-                            driver_label::AbstractString = "",
-                            event_label::AbstractString  = "",
+function generate_lap_video(cfg::RaceConfig, car::Integer, lap::Integer;
                             fps::Int = 25,
                             resolution::Tuple{Int,Int} = (1280, 720),
-                            audio_alignment::Union{Symbol,Real} = _config_alignment(),
-                            fine_tune_s::Real = -.70,
-                            ranges = default_ranges(),
-                            encoder::Symbol = :auto,
                             template::Symbol = :full,
-                            car_number::Union{Nothing,Integer} = nothing,
+                            track::Union{Nothing,Symbol,AbstractString} = :auto,
+                            track_map_db::AbstractString = default_db_path(),
+                            ranges = default_ranges(),
+                            audio_alignment = nothing,
+                            fine_tune_s = nothing,
+                            overwrite::Bool = false,
                             progress::Union{Nothing,Function} = nothing)
-    _require_file(video_path, "video", "PRERACEFILM_DATA_DIR")
-    _require_file(arrow_path, "arrow", "PRERACEFILM_ARROW_DIR")
-    backend = detect_backend(; prefer = encoder)
+    # ── Resolve from the config ──────────────────────────────────────────────
+    session     = find_car_session(cfg, car)
+    video_path  = session.video
+    arrow_path  = session.arrow
+    lap_number  = lap
+    car_number  = Int(car)
+    output_path = joinpath(cfg.output_dir, "$(cfg.race)_car$(car)_lap$(lap).mp4")
+    isdir(dirname(output_path)) || mkpath(dirname(output_path))
+    if !overwrite && isfile(output_path)
+        @info "Already rendered, skipping: $output_path  (pass overwrite=true to redo)"
+        return (output_path = output_path, skipped = true)
+    end
+    driver_label = driver_for(cfg, car)
+    event_label  = let e = event_label_default(cfg)
+        isempty(e) ? something(auto_detect_track(arrow_path), "") : e
+    end
+    audio_alignment = something(audio_alignment, car_override(cfg, car, "audio_alignment"), :seed)
+    ft_ov = car_override(cfg, car, "fine_tune_s")
+    fine_tune_s = fine_tune_s !== nothing ? Float64(fine_tune_s) :
+                  ft_ov       !== nothing ? Float64(ft_ov) : -0.70
+    @info "Rendering $driver_label car #$car lap $lap → $output_path"
+
+    # ── Render ───────────────────────────────────────────────────────────────
+    _require_file(video_path, "video")
+    _require_file(arrow_path, "arrow")
     tel = load_telemetry(arrow_path)
     laps = detect_laps(tel; drop_partial = false)
     lap_row = findfirst(==(Int(lap_number)), laps.lap)
@@ -60,13 +70,14 @@ function generate_lap_video(video_path::AbstractString,
     lap_dur     = lap.duration
 
     # Audio alignment + manual fine-tune
-    raw_offset_s, align_meta = _resolve_alignment(audio_alignment, video_path, arrow_path, backend)
+    est = _resolve_alignment(audio_alignment, video_path, arrow_path)
+    raw_offset_s = est.offset_s
     offset_s = raw_offset_s + Float64(fine_tune_s)
-    align_meta = merge(align_meta, (
-        raw_offset_s   = raw_offset_s,
-        fine_tune_s    = Float64(fine_tune_s),
-        final_offset_s = offset_s,
-    ))
+    align_meta = merge((mode = est.method, confidence = est.confidence,
+                        raw_offset_s   = raw_offset_s,
+                        fine_tune_s    = Float64(fine_tune_s),
+                        final_offset_s = offset_s),
+                       est.detail)
 
     # Map telemetry window → video window
     video_lap_start = t_tel_start - offset_s
@@ -122,7 +133,7 @@ function generate_lap_video(video_path::AbstractString,
     # Car-number graphic for the track-map marker (minimal template only).
     car_graphic = nothing
     if template === :minimal && car_number !== nothing && tm !== nothing
-        car_graphic = load_car_number_graphic(car_number, CAR_NUMBER_GRAPHIC_H, backend)
+        car_graphic = load_car_number_graphic(car_number, CAR_NUMBER_GRAPHIC_H)
         car_graphic === nothing &&
             @warn "No car-number graphic found for car #$car_number — falling back to dot."
     end
@@ -138,25 +149,22 @@ function generate_lap_video(video_path::AbstractString,
     output_dir = dirname(abspath(output_path))
     isdir(output_dir) || mkpath(output_dir)
 
-    proc = with_backend(backend) do exe
-        cmd = String[exe, "-y", "-hide_banner", "-loglevel", "error"]
-        # Hardware decode of source if available
-        append!(cmd, backend.hwaccel_args)
-        append!(cmd, ["-ss", string(video_lap_start), "-t", string(video_lap_dur),
-                      "-i", String(video_path),
-                      "-f", "rawvideo", "-pix_fmt", "bgra",
-                      "-s", "$(layout.W)x$(layout.H)", "-r", string(fps),
-                      "-i", "pipe:0",
-                      "-filter_complex",
-                      "[0:v]scale=$(layout.vid_w):$(layout.top_h)[vid];" *
-                      "color=black:$(layout.W)x$(layout.H):r=$(fps)[bg];" *
-                      "[bg][vid]overlay=0:0[bgv];" *
-                      "[bgv][1:v]overlay=0:0[v]",
-                      "-map", "[v]", "-map", "0:a?"])
-        append!(cmd, backend.encoder_args)
-        append!(cmd, ["-c:a", "aac", "-b:a", "192k", "-shortest", String(output_path)])
-        open(Cmd(cmd), "w")
-    end
+    cmd = String[ffmpeg_exe(), "-y", "-hide_banner", "-loglevel", "error"]
+    append!(cmd, hwaccel_args())                 # hardware decode of source if available
+    append!(cmd, ["-ss", string(video_lap_start), "-t", string(video_lap_dur),
+                  "-i", String(video_path),
+                  "-f", "rawvideo", "-pix_fmt", "bgra",
+                  "-s", "$(layout.W)x$(layout.H)", "-r", string(fps),
+                  "-i", "pipe:0",
+                  "-filter_complex",
+                  "[0:v]scale=$(layout.vid_w):$(layout.top_h)[vid];" *
+                  "color=black:$(layout.W)x$(layout.H):r=$(fps)[bg];" *
+                  "[bg][vid]overlay=0:0[bgv];" *
+                  "[bgv][1:v]overlay=0:0[v]",
+                  "-map", "[v]", "-map", "0:a?"])
+    append!(cmd, encode_args())
+    append!(cmd, ["-c:a", "aac", "-b:a", "192k", "-shortest", String(output_path)])
+    proc = open(Cmd(cmd), "w")
 
     try
         cur_vals = Vector{Float64}(undef, length(channels))
@@ -212,92 +220,53 @@ function generate_lap_video(video_path::AbstractString,
         audio_offset_s  = offset_s,
         track_map_used  = tm !== nothing,
         track_key       = track_key,
-        encoder         = backend.encoder,
-        ffmpeg_backend  = backend.use_system ? :system : :bundled,
+        encoder         = _caps().nvenc ? :h264_nvenc : :libx264,
         template        = template,
         alignment       = align_meta,
     )
 end
 
-"""
-    _config_alignment() -> Union{Symbol,Float64}
-
-Read `[defaults].audio_alignment` from the TOML config. Numbers come back
-as Float64, strings are parsed (numeric strings → Float64, other strings →
-Symbol). Falls back to `:seed`.
-"""
-function _config_alignment()
-    v = config_get("defaults", "audio_alignment", :seed)
-    v isa Symbol     && return v
-    v isa Real       && return Float64(v)
-    if v isa AbstractString
-        n = tryparse(Float64, v)
-        return n === nothing ? Symbol(v) : n
-    end
-    return :seed
-end
-
-function _require_file(path::AbstractString, kind::AbstractString, env_var::AbstractString)
-    isfile(path) && return
-    hint = haskey(ENV, env_var) ?
-        "Currently $env_var = $(ENV[env_var])" :
-        "Tip: set \$env:$env_var to your session library path " *
-        "(e.g. \"D:\\\\Race_Videos\\\\25POC1\") so the CLI / Pluto picker " *
-        "auto-find files."
-    error("""
-        $kind file not found:
-            $path
-        $hint
-        """)
-end
+# Fail early with a clear message instead of a cryptic Arrow/ffmpeg error downstream.
+_require_file(path::AbstractString, kind::AbstractString) =
+    isfile(path) || error("$kind file not found: $path")    #TODO move to config, doesn't belong here
 
 """
-    _resolve_alignment(spec, video_path, arrow_path, backend) -> (offset_s, meta)
+    _resolve_alignment(spec, video_path, arrow_path) -> AlignEstimate
 
 Translate the `audio_alignment` argument into a concrete offset in seconds.
 
 - `:none`     — no shift (telemetry and video already aligned)
-- `:seed`     — fast: race_t_tel − audio_active_t, no FFT correlation
-- `:auto`     — full FFT cross-correlation (slower, lower confidence on
-                short / noisy sessions)
+- `:seed`     — fast: race_t_tel − audio_active_t, no correlation
+- `:audio`    — audio firing-tone ↔ EngineRotVel cross-correlation
+- `:visual`   — streaming aligner (visual_align2): yaw/pitch/roll vs gyros + forward
+                zoom vs GPS speed; returns the gyro lock, the rest in `meta`
 - `Float64 n` — manual override, use as-is
 """
-function _resolve_alignment(spec, video_path, arrow_path, backend)
-    # TODO: migrate this symbol if/elseif chain to multiple dispatch — an abstract
-    # `AlignMode` with concrete `Auto`/`Visual`/`Forward`/`Seed`/`None`/`Manual(x)`
-    # types and a `_resolve_alignment(::Auto, …)` method each. Kills the branch
-    # ladder, makes adding an estimator a new method, and types the spec properly.
-    # TODO: split `:visual` into independent YAW, PITCH, and FORWARD estimators —
-    # four axes total (audio-RPM, yaw, pitch, forward), each its own point in the
-    # spread, instead of bundling yaw+pitch into one joint lock.
-    # TODO: give the user-facing symbols more descriptive names (`:auto` → e.g.
-    # `:audio_rpm`, `:visual` → `:rotation`). Keep the current API for now.
+function _resolve_alignment(spec, video_path, arrow_path)
+    # TODO: migrate this if/elseif chain to multiple dispatch — an abstract `AlignMode`
+    # with concrete `Audio`/`Visual`/`Seed`/`None`/`Manual(x)` types and a
+    # `_resolve_alignment(::Audio, …)` method each, instead of this branch ladder.
+    #TODO: more unified input struct. perhaps raise the config thingy of the visual
+    # allignment thing to a global thing, the audio version has a lot of similarities,
+    # should be more common
     if spec === :none
-        return 0.0, (mode = :none,)
+        return AlignEstimate(0.0, 1.0, :none, (;))
     elseif spec isa Real
-        return Float64(spec), (mode = :override, value = Float64(spec))
+        return AlignEstimate(Float64(spec), 1.0, :override, (;))
     elseif spec === :seed
-        tel = load_telemetry(arrow_path)
-        race_idx     = find_race_start(tel.rpm)
-        race_t_tel   = Float64(tel.time[race_idx])
-        audio_active = find_audio_active_start(video_path; backend = backend)
-        offset = race_t_tel - audio_active
-        return offset, (mode = :seed,
-                        race_t_tel = race_t_tel,
-                        audio_active_vid_s = audio_active,
-                        offset_s = offset)
-    elseif spec === :auto
-        est = align_audio_rpm(video_path, arrow_path)
-        return est.offset_s, merge((mode = :auto, offset_s = est.offset_s,
-                                    confidence = est.confidence, method = est.method), est.detail)
+        time, rpm    = load_channels(arrow_path, CHANNEL_BINDING.time, CHANNEL_BINDING.rpm)
+        race_idx     = find_race_start(rpm)
+        race_t_tel   = time[race_idx]
+        audio_active = find_audio_active_start(video_path)
+        return AlignEstimate(race_t_tel - audio_active, NaN, :seed,
+                             (race_t_tel = race_t_tel, audio_active_vid_s = audio_active))
+    elseif spec === :audio || spec === :auto      # :auto kept as a legacy alias
+        return align_audio_rpm(video_path, arrow_path)        # already an AlignEstimate
     elseif spec === :visual
-        est = align_visual_rotation(video_path, arrow_path; backend = backend)
-        return est.offset_s, merge((mode = :visual, offset_s = est.offset_s,
-                                    confidence = est.confidence, method = est.method), est.detail)
-    elseif spec === :forward
-        est = align_forward_speed(video_path, arrow_path; backend = backend)
-        return est.offset_s, merge((mode = :forward, offset_s = est.offset_s,
-                                    confidence = est.confidence, method = est.method), est.detail)
+        # streaming aligner (visual_align2): yaw is the video↔telemetry lock and already
+        # comes back as an AlignEstimate — pass it straight through. pitch/roll/forward
+        # are independent cross-checks, available in the full align() result if needed.
+        return align(video_path, arrow_path).yaw
     else
         error("Unknown audio_alignment: $spec")
     end
@@ -309,7 +278,8 @@ end
 # The functions below give non-Julia callers (CLI args, HTTP bodies, agent
 # tool calls, batch scripts) a flat config-dict interface to the same core
 # pipeline. They return plain `Dict`s so the result serialises with JSON3
-# without further conversion.
+# without further conversion. #TODO: is this necessary? also, #TODO, use JSON.jl
+
 
 """
     list_laps_json(arrow_path; drop_partial=true) -> Vector{Dict{String,Any}}
@@ -328,29 +298,26 @@ end
 """
     generate_lap_video_json(config::AbstractDict) -> Dict{String,Any}
 
-JSON-friendly wrapper around `generate_lap_video`. Required keys:
-`video_path`, `arrow_path`, `lap_number`, `output_path`. All other keys are
-optional and map to keyword arguments. Returns a result Dict.
+JSON-friendly wrapper around `generate_lap_video`. Required keys: `car`, `lap`
+(and `race`, or omit it to use `[current].race`). Optional keys map to keyword
+arguments (`fps`, `resolution`, `template`, `track`, `audio_alignment`,
+`overwrite`). Returns a result Dict.
 """
 function generate_lap_video_json(config::AbstractDict)
-    video_path   = config["video_path"]
-    arrow_path   = config["arrow_path"]
-    lap_number   = Int(config["lap_number"])
-    output_path  = config["output_path"]
+    cfg = getConfig(String(get(config, "race", "")))
+    car = Int(config["car"])
+    lap = Int(config["lap"])
 
     kwargs = Dict{Symbol,Any}()
     haskey(config, "track")           && (kwargs[:track]           = _maybe_symbol(config["track"]))
     haskey(config, "track_map_db")    && (kwargs[:track_map_db]    = config["track_map_db"])
-    haskey(config, "driver_label")    && (kwargs[:driver_label]    = config["driver_label"])
-    haskey(config, "event_label")     && (kwargs[:event_label]     = config["event_label"])
     haskey(config, "fps")             && (kwargs[:fps]             = Int(config["fps"]))
     haskey(config, "resolution")      && (kwargs[:resolution]      = Tuple{Int,Int}(config["resolution"]))
     haskey(config, "audio_alignment") && (kwargs[:audio_alignment] = _maybe_symbol(config["audio_alignment"]))
-    haskey(config, "encoder")         && (kwargs[:encoder]         = Symbol(config["encoder"]))
     haskey(config, "template")        && (kwargs[:template]        = Symbol(config["template"]))
+    haskey(config, "overwrite")       && (kwargs[:overwrite]       = Bool(config["overwrite"]))
 
-    result = generate_lap_video(video_path, arrow_path, lap_number;
-                                output_path = output_path, kwargs...)
+    result = generate_lap_video(cfg, car, lap; kwargs...)
     return Dict(string(k) => _to_json_value(v) for (k, v) in pairs(result))
 end
 

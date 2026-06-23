@@ -27,12 +27,7 @@
 #   decoder ──► ch ──► [Yaw] ──► ch ──► [Pitch] ──► ch ──► [Forward] ──► pool
 # ─────────────────────────────────────────────────────────────────────────────
 
-using FFTW
-using DSP
-using Statistics
-using Arrow
-using Tables
-using LinearAlgebra: mul!
+
 
 # ── types ────────────────────────────────────────────────────────────────────
 mutable struct Frame
@@ -156,25 +151,24 @@ end
 # recycled Frame from `pool`, reads the next frame straight into its `raw`, widens
 # to `data`, and forwards it. Closes `out_ch` at end-of-stream to drain the chain.
 function run_decoder(out_ch::Channel{Frame}, pool::Channel{Frame}, video_path::AbstractString,
-                     vf::String, start_s::Real, dur_s::Real, fps::Real, backend::FfmpegBackend)
+                     vf::String, start_s::Real, dur_s::Real, fps::Real)
     targs = isfinite(dur_s) ? ["-t", string(dur_s)] : String[]
-    with_backend(backend) do exe
-        io = open(`$exe -hide_banner -loglevel error $(backend.hwaccel_args) -ss $start_s $targs -i $video_path -vf $vf -r $fps -f rawvideo pipe:1`, "r")
-        index = 0
-        while true
-            frame = take!(pool)
-            try
-                read!(io, frame.raw)
-            catch e
-                e isa EOFError && (put!(pool, frame); break)
-                rethrow()
-            end
-            update_frame!(frame, index)
-            put!(out_ch, frame)
-            index += 1
+    exe = ffmpeg_exe()
+    io = open(`$exe -hide_banner -loglevel error $(hwaccel_args()) -ss $start_s $targs -i $video_path -vf $vf -r $fps -f rawvideo pipe:1`, "r")
+    index = 0
+    while true
+        frame = take!(pool)
+        try
+            read!(io, frame.raw)
+        catch e
+            e isa EOFError && (put!(pool, frame); break)
+            rethrow()
         end
-        close(io)
+        update_frame!(frame, index)
+        put!(out_ch, frame)
+        index += 1
     end
+    close(io)
     close(out_ch)
 end
 
@@ -185,17 +179,10 @@ function align(video_path::AbstractString, arrow_path::AbstractString;
                start_s::Real = 300.0, dur_s::Real = 900.0, fps::Real = 30.0,
                frame_w::Int = 320, frame_h::Int = 180,
                rotation_crop = (0.25, 0.50, 0.22, 0.28),
-               forward_crop  = (0.18, 0.64, 0.30, 0.34),
-               backend::FfmpegBackend = detect_backend())
-    # one read; bulk-collect each column to Float64, then drop rows where any is non-finite.
-    tbl   = Arrow.Table(arrow_path)
-    time  = Float64.(tbl.Time)
-    yaw   = Float64.(tbl.ChassisRotVelYawIDR)
-    pitch = Float64.(tbl.ChassisRotVelPitchIDR)
-    speed = Float64.(tbl.VectorGPS_Speed)
-    roll  = Float64.(tbl.ChassisRotVelRollIDR)
-    keep  = isfinite.(yaw) .& isfinite.(pitch) .& isfinite.(speed) .& isfinite.(roll)
-    time = time[keep]; yaw = yaw[keep]; pitch = pitch[keep]; speed = speed[keep]; roll = roll[keep]
+               forward_crop  = (0.18, 0.64, 0.30, 0.34))
+    # one read; Float64 + drop rows where any channel is non-finite (guard at the load site).
+    time, yaw, pitch, speed, roll = load_channels(arrow_path,
+        :Time, :ChassisRotVelYawIDR, :ChassisRotVelPitchIDR, :VectorGPS_Speed, :ChassisRotVelRollIDR)
 
     # ffmpeg returns a bit more than dur·fps (its -ss seeks to a keyframe just before
     # start_s, decoding some pre-roll); over-allocate so the workers never overflow.
@@ -221,7 +208,7 @@ function align(video_path::AbstractString, arrow_path::AbstractString;
     state_fwd = make_state(Forward(),  cfg_fwd)
 
     vf = "scale=$(frame_w):$(frame_h),format=gray"
-    decoder = Threads.@spawn run_decoder(ch_rot, pool, video_path, vf, start_s, dur_s, fps, backend)
+    decoder = Threads.@spawn run_decoder(ch_rot, pool, video_path, vf, start_s, dur_s, fps)
     w_rot = Threads.@spawn run_worker(Rotation(), state_rot, cfg_rot)
     w_fwd = Threads.@spawn run_worker(Forward(),  state_fwd, cfg_fwd)
 
@@ -448,7 +435,9 @@ end
 # Phase-correlate the carried previous log-polar FFT vs this frame's → (angular, radial)
 # = (roll, zoom). Cross-power + phase-normalize fused into ONE pass (sqrt∘abs2, not hypot).
 function lp_shift!(state::ForwardState)
-    cross = state.lp_cross; prev = state.lp_prev_freq; cur = state.lp_freq
+    cross = state.lp_cross
+    prev = state.lp_prev_freq
+    cur = state.lp_freq
     @fastmath @inbounds @simd for i in eachindex(cross)
         z = prev[i] * conj(cur[i])
         cross[i] = z / (sqrt(abs2(z)) + eps())
@@ -462,8 +451,13 @@ function consume!(::Rotation, state::RotationState, config::StageConfig, frame::
     dx, dy = shift!(state, config, frame)
     if !isnan(dx)
         i = advance!(state, config, frame)
-        state.yaw[i] = dx
-        state.pitch[i] = dy
+        # Sign convention (proven, see scratchpad/sign_{calib,telem}.jl): the proxy
+        # measures world-in-frame motion, opposite to the car's rotation — dx>0 = yaw
+        # RIGHT, dy>0 = pitch DOWN. The gyros are x-fwd/y-left/z-up: ChassisRotVelYawIDR>0
+        # = LEFT (−0.87 vs GPS heading), pitch>0 = nose up. Negate so proxy shares the
+        # telemetry sign (proxy+ ↔ telem+), letting the correlation lock the sign.
+        state.yaw[i]   = -dx
+        state.pitch[i] = -dy
     end
     return nothing
 end
@@ -481,51 +475,13 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 # Correlation — at end-of-stream, slide each stage's series against its telemetry
 # reference and return the offset (telemetry_time = video_time + offset) as an
-# AlignEstimate. Rotation band-passes (sign-invariant peak); Forward smooths
-# (signed peak — the speed proxy and speed share sign).
+# AlignEstimate. Rotation band-passes (sign-locked peak — proxy is sign-matched to the
+# gyro); Forward smooths (signed peak — the speed proxy and speed share sign).
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Resample (t, x) onto a uniform fs-Hz grid by linear interpolation, returning
-# (grid_start, values). Both t and the grid are monotonic, so one forward sweep
-# with a sample pointer suffices — no per-query search (the two-pointer trick from
-# ERDP_pipeline's growKernel). The grid is uniform, so the query time is implicit
-# (t0 + (i-1)/fs) and never materialized.
-function _resample(t, x, fs::Float64)
-    t0 = first(t); t1 = last(t); n = length(t)
-    ngrid = floor(Int, (t1 - t0) * fs) + 1
-    out = Vector{Float64}(undef, ngrid)
-    inv_fs = 1.0 / fs                                # hoist the divide out of the loop
-    k = 1                                            # bracket: t[k] ≤ q ≤ t[k+1]
-    @inbounds for i in 1:ngrid
-        q = muladd(i - 1, inv_fs, t0)                # t0 + (i-1)/fs, as an FMA
-        while k < n - 1 && t[k + 1] < q
-            k += 1
-        end
-        tk = t[k]; tk1 = t[k + 1]
-        w = tk1 == tk ? 0.0 : (q - tk) / (tk1 - tk)
-        out[i] = muladd(x[k + 1] - x[k], w, x[k])    # lerp as an FMA
-    end
-    return t0, out
-end
 
 _znorm(x) = (m = mean(x); s = std(x); s == 0 ? x .- m : (x .- m) ./ s)
 
-# Centred moving average — denoise without high-passing (keeps the slow envelope).
-function _smooth(x::Vector{Float64}, n::Int)
-    n <= 1 && return copy(x)
-    cs = pushfirst!(cumsum(x), 0.0); m = length(x); out = Vector{Float64}(undef, m); half = n ÷ 2
-    @inbounds for i in 1:m
-        lo = max(1, i - half); hi = min(m, i + half)
-        out[i] = (cs[hi + 1] - cs[lo]) / (hi - lo + 1)
-    end
-    return out
-end
-
-# Zero-phase Butterworth band-pass.
-function _bandpass(x::Vector{Float64}, fs::Float64; lo = 0.1, hi = 8.0, order = 4)
-    nyquist = fs / 2; hi = min(hi, 0.95 * nyquist); lo = max(lo, 1e-3)
-    return filtfilt(digitalfilter(Bandpass(lo, hi), Butterworth(order); fs = fs), x)
-end
 
 # Normalized sliding cross-correlation: out[L+1] = Pearson(template, ref[L+1:L+m]).
 # prefix/prefix2 are zero-padded prefix sums of ref → branch-free window stats.
@@ -546,9 +502,9 @@ function _ncc!(out::Vector{Float64}, template::Vector{Float64}, ref::Vector{Floa
 end
 
 # Slide the (conditioned, z-normed) series against the conditioned reference and
-# return (offset_s, confidence). `condition` band-passes or smooths each signal;
-# `signed` keeps the max peak (speed) vs the |peak| (rotation, sign/scale-free).
-function _crosscorr(state::State, series, ref_t, ref_x, fs::Float64, condition, signed::Bool)
+# return (offset_s, confidence). `condition` is the activity envelope (see _activity);
+# its output is non-negative, so the lock is always a positive NCC peak.
+function _crosscorr(state::State, series, ref_t, ref_x, fs::Float64, condition)
     vtimes = view(state.times, 1:state.n)
     _, template = _resample(vtimes, view(series, 1:state.n), fs)
     ref_t0, ref = _resample(ref_t, ref_x, fs)
@@ -561,29 +517,30 @@ function _crosscorr(state::State, series, ref_t, ref_x, fs::Float64, condition, 
     Lmax = n - m
     ncc = Vector{Float64}(undef, Lmax + 1)
     _ncc!(ncc, template, ref, prefix, prefix2, m, Lmax)
-    score = signed ? ncc : abs.(ncc)
-    k = argmax(score)
-    sub = 1 < k < length(score) ? _parabolic_peak(score[k - 1], score[k], score[k + 1]) : 0.0
+    k = argmax(ncc)
+    sub = 1 < k < length(ncc) ? _parabolic_peak(ncc[k - 1], ncc[k], ncc[k + 1]) : 0.0
     offset = (ref_t0 + (k - 1 + sub) / fs) - first(vtimes)
-    return offset, score[k]
+    return offset, ncc[k]
 end
 
-# Rotation: yaw and pitch series, each band-passed against its gyro (sign-invariant peak).
+# Activity envelope: rectify + light low-pass — the conditioning that actually locks.
+# Both the video proxy and the gyro share the on-track-vs-pit / corner-by-corner energy;
+# band-passing it (the old approach) deleted the slow envelope that carries the lock.
+# `abs` is sign-invariant, so the −dx/−dy sign bake doesn't matter for the correlation.
+_activity(x, fs; smooth_s = 2.0) = _moving_average(x, max(1, round(Int, smooth_s * fs)); f = abs)
+
+# Rotation: yaw and pitch activity envelopes, each vs its gyro.
 function correlate(::Rotation, state::RotationState, config::StageConfig)
-    bp = (x, fs) -> _bandpass(x, fs)
-    yo, yc = _crosscorr(state, state.yaw,   config.ref_t[1], config.ref_x[1], 30.0, bp, false)
-    po, pc = _crosscorr(state, state.pitch, config.ref_t[2], config.ref_x[2], 30.0, bp, false)
+    yo, yc = _crosscorr(state, state.yaw,   config.ref_t[1], config.ref_x[1], 30.0, _activity)
+    po, pc = _crosscorr(state, state.pitch, config.ref_t[2], config.ref_x[2], 30.0, _activity)
     return [AlignEstimate(yo, yc, :yaw,   (n_frames = state.n,)),
             AlignEstimate(po, pc, :pitch, (n_frames = state.n,))]
 end
 
-# Forward: smooth the zoom proxy vs GPS speed (signed peak); band-pass the roll proxy
-# vs the roll gyro (sign-invariant), same as the yaw/pitch axes.
+# Forward: zoom (∝ speed) and roll activity envelopes, vs GPS speed and the roll gyro.
 function correlate(::Forward, state::ForwardState, config::StageConfig)
-    fo, fc = _crosscorr(state, state.zoom, config.ref_t[1], config.ref_x[1], 5.0,
-                        (x, fs) -> _smooth(x, max(1, round(Int, 3.0 * fs))), true)
-    ro, rc = _crosscorr(state, state.roll, config.ref_t[2], config.ref_x[2], 30.0,
-                        (x, fs) -> _bandpass(x, fs), false)
+    fo, fc = _crosscorr(state, state.zoom, config.ref_t[1], config.ref_x[1], 30.0, _activity)
+    ro, rc = _crosscorr(state, state.roll, config.ref_t[2], config.ref_x[2], 30.0, _activity)
     return [AlignEstimate(fo, fc, :forward, (n_frames = state.n,)),
             AlignEstimate(ro, rc, :roll,    (n_frames = state.n,))]
 end

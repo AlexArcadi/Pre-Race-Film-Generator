@@ -10,7 +10,7 @@
 #     process(cfg; cars=[9], laps=[119])
 #     process(cfg; cars=:all, laps=[1, 50, 119])
 #     process(cfg; cars=[9], laps=:all)   # every detected race lap for car 9
-#     render_lap(cfg, 9, 119)              # one-off, no batching
+#     generate_lap_video(cfg, 9, 119)      # one-off, no batching
 #     list_cars(cfg)                       # who's in this race?
 #     detect_laps(find_car_session(cfg, 9).arrow)  # laps available for car 9
 #
@@ -34,5 +34,5 @@ process(CFG; cars = [77], laps = [119])
 # More examples — uncomment any:
 # process(CFG; cars = [9, 10, 11], laps = [5, 50, 119])
 # process(CFG; cars = [9], laps = :all)
-# render_lap(CFG, 9, 119; overwrite = true)
-# render_lap(CFG, 10, 50; event_label = "Pocono — Friday Practice", fps = 30)
+# generate_lap_video(CFG, 9, 119; overwrite = true)
+# generate_lap_video(CFG, 10, 50; fps = 30)

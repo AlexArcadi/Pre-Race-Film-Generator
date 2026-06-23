@@ -1,128 +1,5 @@
-using TOML
-
-"""
-Per-race configuration. Loaded via `getConfig(race_code)` — the race is
-identified by the config you pass around, NOT by global state. Multiple
-configs for different races can coexist in the same Julia session.
-
-A `RaceConfig` carries:
-
-- The race code, data directory, arrow directory (paths embedded — no
-  more global "current data_dir")
-- Race metadata: event, track, date
-- A filename-stem template for mapping car number → files
-- Driver names by car number
-- Per-car overrides (e.g. baked-in audio_alignment, alternate stem)
-
-The race.toml schema lives at `<data_root>/<race>/race.toml`:
-
-    event     = "25POC1"
-    track     = "Pocono"
-    date      = "2025-06-01"
-    file_stem = "19_POCONO_car{car}_sessionID2"
-
-    [drivers]
-    9 = "Chase Elliott"
-    10 = "Aric Almirola"
-
-    [cars.10]
-    audio_alignment = -1100.0
-    stem = "10_POCONO_alt_naming"
-
-This schema is intentionally close to what an ERDP_DATA per-race config
-could look like, so the two pipelines can share configs later.
-"""
-
-const RACE_CONFIG_FILENAME = "race.toml"
-
-struct RaceConfig
-    race::String                            # e.g. "25POC1"
-    data_dir::String                        # where .mpg files live
-    arrow_dir::String                       # where .arrow files live
-    config_path::String                     # path of the race.toml that was read ("" if absent)
-    event::String
-    track::String
-    date::String
-    file_stem::String                       # template with `{car}` placeholder
-    drivers::Dict{Int,String}
-    car_overrides::Dict{Int,Dict{String,Any}}
-end
-
-# ── Loading ────────────────────────────────────────────────────────────────
-
-"""
-    getConfig(race::AbstractString = "") -> RaceConfig
-
-Resolve and load configuration for a race weekend.
-
-- `race` is the folder name under `[paths].data_root` (e.g. "25POC1").
-  If omitted, falls back to `[current].race` from `config.local.toml`.
-- Reads `<data_root>/<race>/race.toml` if present; otherwise returns a
-  config with empty driver/track/template that still lets filename
-  heuristics work.
-
-Multiple `RaceConfig`s can coexist — pass them explicitly to every
-function that uses one.
-"""
-function getConfig(race::AbstractString = ""; arrow_root::AbstractString = "")
-    race = isempty(race) ? config_get("current", "race", "") : race
-    isempty(race) && error(
-        "No race specified. Either pass a code: `getConfig(\"25POC1\")`, " *
-        "or set `[current].race` in `config.local.toml`.")
-
-    root = String(config_get("paths", "data_root", ""))
-    legacy_data = String(config_get("paths", "data_dir", ""))
-    race_dir = if !isempty(root)
-        joinpath(root, race)
-    elseif !isempty(legacy_data)
-        legacy_data
-    else
-        abspath(joinpath(@__DIR__, "..", "Sample Race Data"))
-    end
-
-    isdir(race_dir) || error(
-        "Race folder not found: $race_dir\n" *
-        "Set `[paths].data_root` in `config.local.toml` (preferred), or " *
-        "use `[paths].data_dir` to point at one race folder directly.")
-
-    arrow_dir = if !isempty(arrow_root)
-        joinpath(arrow_root, race)
-    else
-        legacy_arrow = String(config_get("paths", "arrow_dir", ""))
-        e = get(ENV, "PRERACEFILM_ARROW_DIR", "")
-        !isempty(e) ? e : (!isempty(legacy_arrow) ? legacy_arrow : race_dir)
-    end
-
-    cfg_path = joinpath(race_dir, RACE_CONFIG_FILENAME)
-    if isfile(cfg_path)
-        raw = TOML.parsefile(cfg_path)
-        event     = String(get(raw, "event",     race))
-        track     = String(get(raw, "track",     ""))
-        date      = String(get(raw, "date",      ""))
-        file_stem = String(get(raw, "file_stem", ""))
-
-        drivers = Dict{Int,String}()
-        for (k, v) in get(raw, "drivers", Dict{String,Any}())
-            n = tryparse(Int, String(k))
-            n === nothing || (drivers[n] = String(v))
-        end
-
-        overrides = Dict{Int,Dict{String,Any}}()
-        for (k, v) in get(raw, "cars", Dict{String,Any}())
-            n = tryparse(Int, String(k))
-            n === nothing && continue
-            v isa AbstractDict || continue
-            overrides[n] = Dict{String,Any}(String(kk) => vv for (kk, vv) in v)
-        end
-
-        return RaceConfig(race, race_dir, arrow_dir, cfg_path,
-                          event, track, date, file_stem, drivers, overrides)
-    else
-        return RaceConfig(race, race_dir, arrow_dir, "",
-                          race, "", "", "",
-                          Dict{Int,String}(), Dict{Int,Dict{String,Any}}())
-    end
-end
+# Per-race accessors + render entry points. `RaceConfig` / `getConfig` live in
+# config.jl (the config edge); these consume the resolved config object.
 
 # ── Helpers (cfg-explicit; no global state) ────────────────────────────────
 
@@ -235,58 +112,6 @@ end
 # ── Entry points ───────────────────────────────────────────────────────────
 
 """
-    render_lap(cfg::RaceConfig, car::Integer, lap::Integer;
-               event_label = nothing,
-               driver_label = nothing,
-               overwrite::Bool = false,
-               kwargs...) -> NamedTuple
-
-Render ONE lap for ONE car. Driver name and event label default to values
-from `cfg`. Other kwargs flow through to `generate_lap_video`.
-
-Used internally by `process(cfg; ...)`; safe to call directly for one-off
-work.
-"""
-function render_lap(cfg::RaceConfig, car::Integer, lap::Integer;
-                    event_label = nothing,
-                    driver_label = nothing,
-                    overwrite::Bool = false,
-                    kwargs...)
-    session = find_car_session(cfg, car)
-
-    out = joinpath(output_dir(), "$(cfg.race)_car$(car)_lap$(lap).mp4")
-    isdir(dirname(out)) || mkpath(dirname(out))
-    if !overwrite && isfile(out)
-        @info "Already rendered, skipping: $out  (pass overwrite=true to redo)"
-        return (output_path = out, skipped = true)
-    end
-
-    driver_label === nothing && (driver_label = driver_for(cfg, car))
-    if event_label === nothing
-        e = event_label_default(cfg)
-        event_label = isempty(e) ? something(auto_detect_track(session.arrow), "") : e
-    end
-
-    # Per-car overrides flow in only when the caller didn't already pass them.
-    align_override = car_override(cfg, car, "audio_alignment")
-    if align_override !== nothing && !haskey(kwargs, :audio_alignment)
-        kwargs = (; kwargs..., audio_alignment = align_override)
-    end
-    ft_override = car_override(cfg, car, "fine_tune_s")
-    if ft_override !== nothing && !haskey(kwargs, :fine_tune_s)
-        kwargs = (; kwargs..., fine_tune_s = Float64(ft_override))
-    end
-
-    @info "Rendering $driver_label car #$car lap $lap → $out"
-    return generate_lap_video(session.video, session.arrow, lap;
-        output_path  = out,
-        driver_label = driver_label,
-        event_label  = event_label,
-        car_number   = Int(car),
-        kwargs...)
-end
-
-"""
     process(cfg::RaceConfig; cars=:all, laps=:all, overwrite=false, kwargs...)
 
 Top-level entry point. Render every (car, lap) combination described by
@@ -326,7 +151,7 @@ function process(cfg::RaceConfig;
             Int.(collect(laps))
 
         for lap in car_laps
-            push!(results, render_lap(cfg, car, lap;
+            push!(results, generate_lap_video(cfg, car, lap;
                 audio_alignment = align,
                 overwrite = overwrite,
                 kwargs...))

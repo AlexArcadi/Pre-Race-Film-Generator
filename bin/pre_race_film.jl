@@ -4,9 +4,7 @@
 #
 # Examples:
 #   julia --project=. bin/pre_race_film.jl laps --arrow path/to/session.arrow
-#   julia --project=. bin/pre_race_film.jl render \
-#       --video path/to/session.mpg --arrow path/to/session.arrow \
-#       --lap 50 --out out/lap50.mp4
+#   julia --project=. bin/pre_race_film.jl render --race 25POC1 --car 9 --lap 50
 #
 # All commands print JSON to stdout on success. Errors go to stderr with a
 # non-zero exit code. This is the integration surface used by the AI agent
@@ -43,24 +41,22 @@ Options:
 """
 
 const RENDER_USAGE = """
-render  --video PATH --arrow PATH --lap N --out PATH [options]
+render  --car N --lap N [--race CODE] [options]
 
 Required:
-  --video PATH               .mpg in-car camera video
-  --arrow PATH               .arrow telemetry file
+  --car N                    Car number
   --lap N                    Lap number to render
-  --out PATH                 Output .mp4 path
 
-Common options:
+Options:
+  --race CODE                Race folder (default: [current].race in config)
   --track NAME               Track key (e.g. "Pocono"). Default: auto-detect
   --no-track                 Skip the mini-map entirely
-  --driver LABEL             Driver string for the overlay
-  --event LABEL              Event string for the overlay
   --fps N                    Output fps (default 25)
   --width N                  Output width (default 1280)
   --height N                 Output height (default 720)
+  --template NAME            full | minimal (default full)
   --align MODE               seed | auto | none | <offset_s>  (default: seed)
-  --encoder MODE             auto | gpu | cpu | system | bundled (default: auto)
+  --overwrite                Re-render even if the output exists
 """
 
 function main(argv::Vector{String})
@@ -111,19 +107,17 @@ function cmd_render(args::Vector{String})
     end
     opts = parse_args(args)
     config = Dict{String,Any}(
-        "video_path"  => required(opts, "video"),
-        "arrow_path"  => required(opts, "arrow"),
-        "lap_number"  => parse(Int, required(opts, "lap")),
-        "output_path" => required(opts, "out"),
+        "car" => parse(Int, required(opts, "car")),
+        "lap" => parse(Int, required(opts, "lap")),
     )
-    haskey(opts, "track")    && (config["track"]        = opts["track"])
-    haskey(opts, "no-track") && (config["track"]        = nothing)
-    haskey(opts, "driver")   && (config["driver_label"] = opts["driver"])
-    haskey(opts, "event")    && (config["event_label"]  = opts["event"])
-    haskey(opts, "fps")      && (config["fps"]          = parse(Int, opts["fps"]))
+    haskey(opts, "race")      && (config["race"]      = opts["race"])
+    haskey(opts, "track")     && (config["track"]     = opts["track"])
+    haskey(opts, "no-track")  && (config["track"]     = nothing)
+    haskey(opts, "fps")       && (config["fps"]       = parse(Int, opts["fps"]))
     haskey(opts, "width") && haskey(opts, "height") &&
         (config["resolution"] = [parse(Int, opts["width"]), parse(Int, opts["height"])])
-    haskey(opts, "encoder")  && (config["encoder"]      = opts["encoder"])
+    haskey(opts, "template")  && (config["template"]  = opts["template"])
+    haskey(opts, "overwrite") && (config["overwrite"] = true)
 
     if haskey(opts, "align")
         v = opts["align"]
@@ -137,13 +131,11 @@ function cmd_render(args::Vector{String})
 end
 
 function cmd_backend(_args::Vector{String})
-    bk = detect_backend()
+    caps = PreRaceFilm._caps()
     JSON3.pretty(stdout, Dict(
-        "exe"        => bk.exe,
-        "use_system" => bk.use_system,
-        "encoder"    => bk.encoder,
-        "nvenc"      => bk.has_nvenc,
-        "nvdec"      => bk.has_nvdec,
+        "ffmpeg" => ffmpeg_exe(),
+        "nvenc"  => caps.nvenc,
+        "nvdec"  => caps.nvdec,
     ))
     println()
     return 0

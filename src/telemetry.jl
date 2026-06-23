@@ -53,6 +53,23 @@ function load_telemetry(arrow_path::AbstractString)
 end
 
 """
+    load_channels(arrow_path, channels...) -> Tuple of Vector{Float64}
+
+Read the named channels as `Float64` and drop every row where ANY of them is
+non-finite (one shared keep-mask), so callers get clean, equal-length signals.
+This is the single NaN guard for telemetry — downstream code assumes finite input.
+"""
+function load_channels(arrow_path::AbstractString, channels::Symbol...)
+    tbl  = Arrow.Table(arrow_path)
+    cols = [Float64.(getproperty(tbl, c)) for c in channels]
+    keep = trues(length(first(cols)))
+    for c in cols
+        keep .&= isfinite.(c)
+    end
+    return Tuple(c[keep] for c in cols)
+end
+
+"""
     detect_laps(arrow_path; min_seconds=20.0, drop_partial=true) -> DataFrame
 
 Detect contiguous runs per `lap` value and return a per-lap summary.

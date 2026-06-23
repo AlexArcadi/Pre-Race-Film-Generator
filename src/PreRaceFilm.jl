@@ -1,15 +1,22 @@
 module PreRaceFilm
 
 using Printf
+using Arrow
+using Tables
+using DSP
+using FFTW
+using Statistics
+using LinearAlgebra: mul!
 
+
+
+include("math.jl")
 include("runtime.jl")
 include("config.jl")
 include("telemetry.jl")
-include("datadir.jl")
 include("race.jl")
 include("track_map.jl")
 include("alignment.jl")
-include("visual_align.jl")
 include("visual_align2.jl")
 include("render.jl")
 include("render_minimal.jl")
@@ -19,8 +26,6 @@ export detect_laps,
        load_telemetry,
        load_track_map,
        align_audio_rpm,
-       align_visual_rotation,
-       video_rotation_track,
        find_race_start,
        find_audio_active_start,
        generate_lap_video,
@@ -28,20 +33,17 @@ export detect_laps,
        list_laps_json,
        default_ranges,
        default_db_path,
-       detect_backend,
+       ffmpeg_exe,
+       probe_video,
        auto_detect_track,
        data_dir,
        arrow_dir,
-       output_dir,
-       set_data_dir,
        list_session_files,
        load_config,
-       config_path,
        config_get,
        RaceConfig,
        getConfig,
        process,
-       render_lap,
        stem_for,
        video_stem_for,
        arrow_stem_for,
