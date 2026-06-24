@@ -64,8 +64,18 @@ function generate_lap_video(cfg::RaceConfig, car::Integer, lap::Integer;
         "`alignment_method` in race.toml (race-wide or under [cars.$car]).")
     ft_ov = car_override(cfg, car, "fine_tune_s")
     fine_tune_s = fine_tune_s !== nothing ? Float64(fine_tune_s) :
-                  ft_ov       !== nothing ? Float64(ft_ov) : -0.70
+                  ft_ov       !== nothing ? Float64(ft_ov) : 1.0
     @info "Rendering $driver_label car #$car lap $lap → $output_path"
+
+
+"""
+use this after every fine tune adjustment
+
+using Revise           
+using PreRaceFilm
+cfg = getConfig("25SON1")
+
+"""
 
     # ── Render ───────────────────────────────────────────────────────────────
     _require_file(video_path, "video")
@@ -130,10 +140,22 @@ function generate_lap_video(cfg::RaceConfig, car::Integer, lap::Integer;
     t_raw    = Float64.(view(tel.time, lap_rows))
     t_norm   = (t_raw .- t_raw[1]) ./ (t_raw[end] - t_raw[1])
     lap_fracs = Float64.(view(tel.lap_frac, lap_rows))
-    # OTD_Conv_LapFraction is cumulative (lap_int + frac), so subtract floor
-    # to get [0,1) and multiply by total distance for arc length.
-    track_dist = tm === nothing ? zeros(Float64, length(lap_fracs)) :
-        ((lap_fracs .- floor.(lap_fracs)) .* tm.total_dist_ft)
+    # Marker position is integrated GPS speed (mph → ft/s, cumulative). Using
+    # lap_frac × total_dist_ft directly puts the dot on the vendor's reference
+    # line, which doesn't match OUR polygon's arc-length parameterization
+    # through corners — the dot drifts ahead/behind in twisty sections. The
+    # integrated-speed track_dist advances at the car's actual physical rate
+    # (slows under braking, accelerates on exit) so it lines up with our
+    # polygon's arc-length table directly. Lap-start position is still
+    # anchored to lap_frac so the dot begins at the right S/F offset.
+    track_dist = if tm === nothing
+        zeros(Float64, length(lap_fracs))
+    else
+        speed_fts = Float64.(view(tel.speed, lap_rows)) .* (5280.0 / 3600.0)
+        dt        = vcat(0.0, diff(t_raw))
+        anchor    = (lap_fracs[1] - floor(lap_fracs[1])) * tm.total_dist_ft
+        anchor .+ cumsum(speed_fts .* dt)
+    end
 
     static_surface = template === :minimal ?
         bake_static_surface_minimal(layout, channels, t_norm, track_surface,

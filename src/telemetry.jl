@@ -30,7 +30,7 @@ default_ranges() = (
     gear     = (0.5, 5.5),
     throttle = (0.0, 100.0),
     brake    = (0.0, 900.0),
-    steering = (-50.0, 50.0),
+    steering = (-185.0, 65.0),
 )
 
 """
