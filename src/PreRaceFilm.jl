@@ -20,6 +20,7 @@ include("alignment.jl")
 include("visual_align2.jl")
 include("render.jl")
 include("render_minimal.jl")
+include("render_raw.jl")
 include("pipeline.jl")
 
 export detect_laps,

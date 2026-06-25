@@ -44,7 +44,8 @@ function generate_lap_video(cfg::RaceConfig, car::Integer, lap::Integer;
     arrow_path  = session.arrow
     lap_number  = lap
     car_number  = Int(car)
-    output_path = joinpath(cfg.output_dir, "$(cfg.race)_car$(car)_lap$(lap).mp4")
+    suffix      = template === :raw ? "_raw" : ""
+    output_path = joinpath(cfg.output_dir, "$(cfg.race)_car$(car)_lap$(lap)$(suffix).mp4")
     isdir(dirname(output_path)) || mkpath(dirname(output_path))
     if !overwrite && isfile(output_path)
         @info "Already rendered, skipping: $output_path  (pass overwrite=true to redo)"
@@ -109,6 +110,25 @@ cfg = getConfig("25SON1")
         video_lap_start = 0.0
     end
 
+    # `:raw` is a bare clip — skip all the Cairo bake/draw + filter-graph work
+    # below and hand off to render_raw_clip. Still uses the same alignment +
+    # fine_tune resolution so the cut lands on the right lap boundary.
+    if template === :raw
+        raw = render_raw_clip(video_path, video_lap_start, video_lap_dur, output_path)
+        return (
+            output_path     = raw.output_path,
+            file_size_mb    = raw.file_size_mb,
+            lap_number      = Int(lap_number),
+            lap_time_s      = lap_dur,
+            audio_offset_s  = offset_s,
+            track_map_used  = false,
+            track_key       = nothing,
+            encoder         = raw.encoder,
+            template        = :raw,
+            alignment       = align_meta,
+        )
+    end
+
     # Track map (auto-detect from filename if track == :auto / "auto")
     tm = nothing
     track_key = nothing
@@ -133,7 +153,7 @@ cfg = getConfig("25SON1")
         build_channels_minimal(tel, lap_rows, ranges) :
         template === :full ?
             build_channels(tel, lap_rows, ranges) :
-            error("Unknown template: $template (expected :full or :minimal)")
+            error("Unknown template: $template (expected :full | :minimal | :raw)")
     stats = template === :minimal ?
         build_stats_minimal(tel, lap_rows, ranges) :
         ChannelTrace[]
