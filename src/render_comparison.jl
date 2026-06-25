@@ -118,6 +118,7 @@ function bake_static_surface_comparison(layout::OverlayLayout,
                                         t_norm_A::Vector{Float64},
                                         t_norm_B::Vector{Float64},
                                         faster_id::Symbol,
+                                        carA::Integer, carB::Integer,
                                         driver_A_label::AbstractString,
                                         driver_B_label::AbstractString,
                                         event_label::AbstractString)
@@ -140,18 +141,11 @@ function bake_static_surface_comparison(layout::OverlayLayout,
     move_to(cr, val_right_x, layout.top_h); line_to(cr, val_right_x, layout.H)
     stroke(cr)
 
-    # Driver / event labels — top-left of each video pane (over the eventual
-    # video, transparent overlay; the text shows against the moving image).
-    select_font_face(cr, "monospace", Cairo.FONT_SLANT_NORMAL, Cairo.FONT_WEIGHT_BOLD)
-    set_font_size(cr, 14)
-    set_rgb!(cr, color_A)
-    move_to(cr, 8, 18); show_text(cr, String(driver_A_label))
-    set_rgb!(cr, color_B)
-    move_to(cr, layout.vid_w + 8, 18); show_text(cr, String(driver_B_label))
-    set_font_size(cr, 11)
-    set_rgb!(cr, colorant"#cccccc")
-    move_to(cr, 8, 34); show_text(cr, String(event_label))
-    move_to(cr, layout.vid_w + 8, 34); show_text(cr, String(event_label))
+    # Driver / event header — top-left of each video pane. Painted onto a
+    # translucent dark backdrop so the text reads cleanly against bright sky,
+    # asphalt, or whatever else the video is showing through.
+    _draw_corner_header(cr, 0,            driver_A_label, event_label, color_A)
+    _draw_corner_header(cr, layout.vid_w, driver_B_label, event_label, color_B)
 
     # Traces: both drivers, every row, color overridden to faster/slower
     nch    = length(channels_A)
@@ -188,19 +182,22 @@ function bake_static_surface_comparison(layout::OverlayLayout,
         end
         stroke_polyline!(cr, xs, ys, color_B, 1.2)
 
-        # Channel label (left edge of trace strip, neutral color)
+        # Channel label (left edge of trace strip). Pinned to the BOTTOM of
+        # the row — the previous mid-row placement put the text ascender close
+        # enough to the divider above that it clipped on some fonts.
         select_font_face(cr, "monospace", Cairo.FONT_SLANT_NORMAL, Cairo.FONT_WEIGHT_BOLD)
         set_font_size(cr, 10)
         set_rgb!(cr, colorant"#dddddd")
         label = ch_A.unit == "" ? String(ch_A.name) : "$(ch_A.name) $(ch_A.unit)"
-        move_to(cr, 6, y_bot + row_h / 2 + 3); show_text(cr, label)
+        move_to(cr, 6, y_bot + row_h - 8); show_text(cr, label)
 
-        # Value sub-column captions (small, above each driver's number)
+        # Value sub-column captions — small car-number labels above each
+        # driver's number, color-coded the same as their trace.
         set_font_size(cr, 9)
         set_rgb!(cr, color_A)
-        move_to(cr, val_left_x + 8, y_bot + 12); show_text(cr, "A")
+        move_to(cr, val_left_x  + 8, y_bot + 18); show_text(cr, "#$(carA) Car")
         set_rgb!(cr, color_B)
-        move_to(cr, val_right_x + 8, y_bot + 12); show_text(cr, "B")
+        move_to(cr, val_right_x + 8, y_bot + 18); show_text(cr, "#$(carB) Car")
     end
 
     return surf
@@ -309,4 +306,36 @@ function _draw_stat_box(cr, x::Real, y::Real, color::Colorant,
         tx   = col_x + col_w / 2 - te[3] / 2 - te[1]
         move_to(cr, tx, y + STAT_BOX_H - 14); show_text(cr, text)
     end
+end
+
+# Driver / event header for the top-left of one video pane. Translucent dark
+# backdrop sized to the longer of the two strings, so it reads cleanly against
+# any video frame underneath. `x` is the left edge of the video pane.
+function _draw_corner_header(cr, x::Real,
+                             driver_label::AbstractString,
+                             event_label::AbstractString,
+                             driver_color::Colorant)
+    pad_x = 8
+    pad_y = 6
+    select_font_face(cr, "monospace", Cairo.FONT_SLANT_NORMAL, Cairo.FONT_WEIGHT_BOLD)
+
+    # Measure both strings at their final sizes so the backdrop fits exactly.
+    set_font_size(cr, 18)
+    de = text_extents(cr, String(driver_label))   # driver line
+    set_font_size(cr, 12)
+    ee = text_extents(cr, String(event_label))    # event line
+
+    box_w = max(de[3], ee[3]) + 2 * pad_x
+    box_h = de[4] + ee[4] + 3 * pad_y
+    paint_rect!(cr, x + 6, 6, box_w, box_h, colorant"#000000"; alpha = 0.65)
+
+    # Driver number/name — bigger, colored
+    set_font_size(cr, 18)
+    set_rgb!(cr, driver_color)
+    move_to(cr, x + 6 + pad_x, 6 + pad_y + de[4]); show_text(cr, String(driver_label))
+
+    # Event/track — smaller, light gray
+    set_font_size(cr, 12)
+    set_rgb!(cr, colorant"#eeeeee")
+    move_to(cr, x + 6 + pad_x, 6 + pad_y + de[4] + pad_y + ee[4]); show_text(cr, String(event_label))
 end

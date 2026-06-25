@@ -382,14 +382,17 @@ function generate_comparison_video(cfg::RaceConfig,
     t_norm_B = (t_raw_B .- t_raw_B[1]) ./ faster_dur
 
     layout = comparison_layout(resolution[1], resolution[2])
-    driver_A_label = "#$(carA) " * driver_for(cfg, carA)
-    driver_B_label = "#$(carB) " * driver_for(cfg, carB)
+    # driver_for already returns a "Car #N" string when no driver name is set,
+    # so don't prefix with car number again — that's where the duplicate came from.
+    driver_A_label = driver_for(cfg, carA)
+    driver_B_label = driver_for(cfg, carB)
     event_label    = let e = event_label_default(cfg)
         isempty(e) ? something(auto_detect_track(sess_A.arrow), "") : e
     end
 
     static_surface = bake_static_surface_comparison(layout, channels_A, channels_B,
                                                     t_norm_A, t_norm_B, faster_id,
+                                                    Int(carA), Int(carB),
                                                     driver_A_label, driver_B_label,
                                                     event_label)
 
