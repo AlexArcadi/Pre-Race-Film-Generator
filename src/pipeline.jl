@@ -36,6 +36,8 @@ function generate_lap_video(cfg::RaceConfig, car::Integer, lap::Integer;
                             ranges = default_ranges(),
                             alignment_method = nothing,
                             fine_tune_s = nothing,
+                            start_loop::Union{Nothing,AbstractString} = nothing,
+                            end_loop::Union{Nothing,AbstractString}   = nothing,
                             overwrite::Bool = false,
                             progress::Union{Nothing,Function} = nothing)
     # ── Resolve from the config ──────────────────────────────────────────────
@@ -44,8 +46,10 @@ function generate_lap_video(cfg::RaceConfig, car::Integer, lap::Integer;
     arrow_path  = session.arrow
     lap_number  = lap
     car_number  = Int(car)
-    suffix      = template === :raw ? "_raw" : ""
-    output_path = joinpath(cfg.output_dir, "$(cfg.race)_car$(car)_lap$(lap)$(suffix).mp4")
+    loop_sfx    = _loop_suffix(start_loop, end_loop)
+    tmpl_sfx    = template === :raw ? "_raw" : ""
+    output_path = joinpath(cfg.output_dir,
+                           "$(cfg.race)_car$(car)_lap$(lap)$(loop_sfx)$(tmpl_sfx).mp4")
     isdir(dirname(output_path)) || mkpath(dirname(output_path))
     if !overwrite && isfile(output_path)
         @info "Already rendered, skipping: $output_path  (pass overwrite=true to redo)"
@@ -86,10 +90,13 @@ cfg = getConfig("25SON1")
     lap_row = findfirst(==(Int(lap_number)), laps.lap)
     lap_row === nothing && error("Lap $lap_number not found in $arrow_path")
     lap = laps[lap_row, :]
-    lap_rows = lap.row_start:lap.row_end
-
-    t_tel_start = lap.t_start
-    lap_dur     = lap.duration
+    full_lap_rows = lap.row_start:lap.row_end
+    # Optionally narrow the window to between two timing loops within the lap.
+    # No-op when both kwargs are nothing.
+    lap_rows, t_tel_start, t_tel_end =
+        _narrow_lap_to_loops(tel, full_lap_rows, start_loop, end_loop,
+                             Float64(lap.t_start), Float64(lap.t_end))
+    lap_dur = t_tel_end - t_tel_start
 
     # Resolve the chosen method to a concrete offset + manual fine-tune
     est = _resolve_alignment(method, video_path, arrow_path)
@@ -299,14 +306,17 @@ function generate_comparison_video(cfg::RaceConfig,
                                    carB::Integer, lapB::Integer;
                                    alignment_method = nothing,
                                    fine_tune_s = nothing,
+                                   start_loop::Union{Nothing,AbstractString} = nothing,
+                                   end_loop::Union{Nothing,AbstractString}   = nothing,
                                    fps::Int = 25,
                                    resolution::Tuple{Int,Int} = (1280, 720),
                                    ranges = default_ranges(),
                                    overwrite::Bool = false)
     sess_A = find_car_session(cfg, carA)
     sess_B = find_car_session(cfg, carB)
+    loop_sfx    = _loop_suffix(start_loop, end_loop)
     output_path = joinpath(cfg.output_dir,
-        "$(cfg.race)_car$(carA)vs$(carB)_lap$(lapA)vs$(lapB)_comparison.mp4")
+        "$(cfg.race)_car$(carA)vs$(carB)_lap$(lapA)vs$(lapB)$(loop_sfx)_comparison.mp4")
     isdir(dirname(output_path)) || mkpath(dirname(output_path))
     if !overwrite && isfile(output_path)
         @info "Already rendered, skipping: $output_path  (pass overwrite=true to redo)"
@@ -346,17 +356,27 @@ function generate_comparison_video(cfg::RaceConfig,
     row_A === nothing && error("Lap $lapA not found in $(sess_A.arrow)")
     row_B === nothing && error("Lap $lapB not found in $(sess_B.arrow)")
     info_A = laps_A[row_A, :]; info_B = laps_B[row_B, :]
-    lap_rows_A_full = info_A.row_start:info_A.row_end
-    lap_rows_B_full = info_B.row_start:info_B.row_end
-    lap_dur_A = info_A.duration; lap_dur_B = info_B.duration
+
+    # Optionally narrow each driver's window to between the requested loops.
+    # Same loop names apply to both drivers; each finds their own crossing.
+    full_rows_A = info_A.row_start:info_A.row_end
+    full_rows_B = info_B.row_start:info_B.row_end
+    lap_rows_A_full, t_a_start, t_a_end =
+        _narrow_lap_to_loops(tel_A, full_rows_A, start_loop, end_loop,
+                             Float64(info_A.t_start), Float64(info_A.t_end))
+    lap_rows_B_full, t_b_start, t_b_end =
+        _narrow_lap_to_loops(tel_B, full_rows_B, start_loop, end_loop,
+                             Float64(info_B.t_start), Float64(info_B.t_end))
+    lap_dur_A = t_a_end - t_a_start
+    lap_dur_B = t_b_end - t_b_start
 
     est_A = _resolve_alignment(method_A, sess_A.video, sess_A.arrow)
     est_B = _resolve_alignment(method_B, sess_B.video, sess_B.arrow)
     offset_A = est_A.offset_s + ft_A
     offset_B = est_B.offset_s + ft_B
 
-    video_lap_start_A = max(0.0, info_A.t_start - offset_A)
-    video_lap_start_B = max(0.0, info_B.t_start - offset_B)
+    video_lap_start_A = max(0.0, t_a_start - offset_A)
+    video_lap_start_B = max(0.0, t_b_start - offset_B)
 
     # Sync: faster driver sets the clip length. Slower driver's tail is cut.
     faster_id  = faster_driver(lap_dur_A, lap_dur_B)
@@ -487,6 +507,75 @@ end
 # Fail early with a clear message instead of a cryptic Arrow/ffmpeg error downstream.
 _require_file(path::AbstractString, kind::AbstractString) =
     isfile(path) || error("$kind file not found: $path")    #TODO move to config, doesn't belong here
+
+# Narrow `lap_rows` (and the corresponding [t_start, t_end] window) to the
+# segment between two timing loops. Either bound can be `nothing` to leave that
+# end of the window at the lap boundary.
+#
+# Important subtlety: a NASCAR lap's `lap`-channel value increments AT the S/F
+# crossing, so row 1 of lap N is an "SF" sample (the one that flipped the
+# counter), and the SF that ENDS lap N is actually the row 1 of lap N+1.
+# To handle "from L10 to next SF" (the end of the lap), we always search
+# `end_loop` strictly AFTER `start_loop`'s row, and we allow that search to
+# extend into the following lap by up to one full lap's worth of rows.
+function _narrow_lap_to_loops(tel, lap_rows::UnitRange{Int},
+                              start_loop::Union{Nothing,AbstractString},
+                              end_loop::Union{Nothing,AbstractString},
+                              default_t_start::Float64, default_t_end::Float64)
+    (start_loop === nothing && end_loop === nothing) &&
+        return lap_rows, default_t_start, default_t_end
+
+    n_total = length(tel.time)
+
+    # 1) Start: first occurrence of start_loop within the lap.
+    start_row = first(lap_rows)
+    t_start   = default_t_start
+    if start_loop !== nothing
+        loops  = String.(view(tel.loop, lap_rows))
+        idx    = findfirst(==(String(start_loop)), loops)
+        if idx === nothing
+            present = sort(unique(loops))
+            error("start_loop '$start_loop' not crossed during this lap. " *
+                  "Loops present in this lap: $(join(present, ", "))")
+        end
+        start_row = lap_rows[idx]
+        t_start   = Float64(tel.time[start_row])
+    end
+
+    # 2) End: first occurrence of end_loop AFTER start_row, scanning up to one
+    # full extra lap of samples so the SF that ends this lap (which belongs to
+    # lap N+1's row range) is reachable.
+    end_row = last(lap_rows)
+    t_end   = default_t_end
+    if end_loop !== nothing
+        search_from = start_row + 1
+        lookahead   = min(n_total, last(lap_rows) + length(lap_rows))
+        range       = search_from:lookahead
+        loops       = String.(view(tel.loop, range))
+        idx         = findfirst(==(String(end_loop)), loops)
+        if idx === nothing
+            present = sort(unique(String.(view(tel.loop, lap_rows))))
+            error("end_loop '$end_loop' not crossed after start_loop in this lap " *
+                  "or the following lap. Loops present in this lap: $(join(present, ", "))")
+        end
+        end_row = search_from + idx - 1
+        t_end   = Float64(tel.time[end_row])
+    end
+
+    return start_row:end_row, t_start, t_end
+end
+
+# Filename-safe suffix carrying the chosen loop window. Empty when both args
+# are nothing (no rename, no path collision with full-lap renders).
+function _loop_suffix(start_loop::Union{Nothing,AbstractString},
+                     end_loop::Union{Nothing,AbstractString})
+    _safe(s) = replace(String(s), "/" => "", " " => "")
+    parts = String[]
+    start_loop !== nothing && push!(parts, "from$(_safe(start_loop))")
+    end_loop   !== nothing && push!(parts, "to$(_safe(end_loop))")
+    isempty(parts) && return ""
+    return "_" * join(parts, "_")
+end
 
 """
     _resolve_alignment(spec, video_path, arrow_path) -> AlignEstimate
